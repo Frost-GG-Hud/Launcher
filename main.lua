@@ -19,6 +19,24 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 
+-- Configure WindUI Parent to avoid CoreGui/Plugin capability isolation
+if WindUI and WindUI.SetParent and LocalPlayer then
+    pcall(function()
+        WindUI:SetParent(LocalPlayer:WaitForChild("PlayerGui"))
+    end)
+end
+if WindUI and WindUI.Creator and WindUI.Creator.UpdateFont then
+    local origUpdateFont = WindUI.Creator.UpdateFont
+    WindUI.Creator.UpdateFont = function(u)
+        WindUI.Creator.Font = u
+        for _, x in next, WindUI.Creator.FontObjects do
+            pcall(function()
+                x.FontFace = Font.new(u, x.FontFace.Weight, x.FontFace.Style)
+            end)
+        end
+    end
+end
+
 -- Fetch Game Name safely
 local gameName = "Universal"
 pcall(function()
@@ -169,109 +187,6 @@ local TabMain = Window:Tab({
     Icon = "layout-grid",
 })
 
-local customSpeedEnabled = false
-local customSpeedValue = 16
-local infiniteJumpEnabled = false
-
-local function applySpeed()
-    if LocalPlayer.Character then
-        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum.WalkSpeed = customSpeedEnabled and customSpeedValue or 16
-        end
-    end
-end
-
-LocalPlayer.CharacterAdded:Connect(function(char)
-    local hum = char:WaitForChild("Humanoid", 5)
-    if hum and customSpeedEnabled then
-        hum.WalkSpeed = customSpeedValue
-    end
-end)
-
-UserInputService.JumpRequest:Connect(function()
-    if infiniteJumpEnabled and LocalPlayer.Character then
-        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-    end
-end)
-
-local MainSectionChar = TabMain:Section({
-    Title = "Character",
-    Icon = "user",
-    Opened = true,
-})
-
-MainSectionChar:Toggle({
-    Title = "Speed Boost",
-    Desc = "Toggle custom movement speed",
-    Value = false,
-    Callback = function(state)
-        customSpeedEnabled = state
-        applySpeed()
-        WindUI:Notify({
-            Title = "Speed Boost",
-            Content = state and string.format("Speed boost active (%d)", customSpeedValue) or "Speed boost toggled OFF",
-            Duration = 2,
-            Icon = state and "check" or "x",
-        })
-    end,
-})
-
-MainSectionChar:Slider({
-    Title = "Walk Speed Value",
-    Desc = "Set target walk speed",
-    Value = {
-        Min = 16,
-        Max = 200,
-        Default = 16,
-    },
-    Step = 1,
-    Callback = function(val)
-        customSpeedValue = val
-        if customSpeedEnabled then
-            applySpeed()
-        end
-    end,
-})
-
-MainSectionChar:Toggle({
-    Title = "Infinite Jump",
-    Desc = "Allows jumping repeatedly in air",
-    Value = false,
-    Callback = function(state)
-        infiniteJumpEnabled = state
-        WindUI:Notify({
-            Title = "Infinite Jump",
-            Content = state and "Infinite jump enabled" or "Infinite jump disabled",
-            Duration = 2,
-            Icon = state and "check" or "x",
-        })
-    end,
-})
-
-local MainSectionWorld = TabMain:Section({
-    Title = "World & Environment",
-    Icon = "globe",
-    Opened = true,
-})
-
-MainSectionWorld:Dropdown({
-    Title = "Lighting Preset",
-    Desc = "Choose a visual environment filter",
-    Values = { "Normal", "Frost Blue", "Night Vision", "Warm Sunset", "High Contrast" },
-    Value = "Normal",
-    Callback = function(selected)
-        WindUI:Notify({
-            Title = "Lighting",
-            Content = "Selected preset: " .. selected,
-            Duration = 2,
-            Icon = "sun",
-        })
-    end,
-})
 
 ----------------------------------------------------------------------
 -- AUTO EGG COLLECTOR & MOVEMENT ENGINE
@@ -295,6 +210,16 @@ pcall(function()
     end
 end)
 
+local EggRecords
+pcall(function()
+    EggRecords = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Util"):WaitForChild("EggRecords"))
+end)
+
+local AssetEarnings
+pcall(function()
+    AssetEarnings = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Util"):WaitForChild("AssetEarnings"))
+end)
+
 local CarrySignal = Instance.new("BindableEvent")
 local DepositSignal = Instance.new("BindableEvent")
 
@@ -310,12 +235,166 @@ local AutoCollector = {
     IsCarrying = false,
     CarriedEggUid = nil,
     CarriedPayload = nil,
+    StealByValueEnabled = false,
+    MinEggValue = 0,
+    MinEggValueRaw = "0",
     Stats = {
         Collected = 0,
-        Deposited = 0,
     },
     Thread = nil,
 }
+
+local AutoPlanter = {
+    Enabled = false,
+    Stats = {
+        Planted = 0,
+    },
+    Thread = nil,
+}
+
+-- Value Parsing & Formatting Helpers (Supports K, M, B, T)
+local function parseValueString(str)
+    if type(str) == "number" then return str end
+    if type(str) ~= "string" then return 0 end
+    str = str:gsub("%s+", ""):upper()
+    local numStr, suffix = str:match("^([%d%.]+)([KMBGT]?)$")
+    if not numStr then return tonumber(str) or 0 end
+    local num = tonumber(numStr) or 0
+    if suffix == "K" then
+        return num * 1e3
+    elseif suffix == "M" then
+        return num * 1e6
+    elseif suffix == "B" then
+        return num * 1e9
+    elseif suffix == "T" then
+        return num * 1e12
+    end
+    return num
+end
+
+local function formatValue(num)
+    if not num or num < 0 then return "0" end
+    if num >= 1e12 then
+        return string.format("%.2fT", num / 1e12)
+    elseif num >= 1e9 then
+        return string.format("%.2fB", num / 1e9)
+    elseif num >= 1e6 then
+        return string.format("%.2fM", num / 1e6)
+    elseif num >= 1e3 then
+        return string.format("%.2fK", num / 1e3)
+    else
+        return tostring(math.floor(num))
+    end
+end
+
+-- Evaluates the actual post-hatch pet money income per second for an egg record
+local function getEggHatchIncomePerSecond(eggRecord)
+    if not eggRecord then return nil end
+    local rate = nil
+    pcall(function()
+        if AssetEarnings and EggRecords and EggRecords.ToAssetItemData then
+            local itemData = EggRecords.ToAssetItemData(eggRecord)
+            if itemData then
+                rate = AssetEarnings.RatePerSecond(itemData)
+            end
+        end
+        if not rate and AssetEarnings and AssetEarnings.RatePerSecond and eggRecord.AssetCategory then
+            rate = AssetEarnings.RatePerSecond({
+                Category = eggRecord.AssetCategory,
+                Scale = eggRecord.AssetScale or 1,
+                Mutations = eggRecord.Mutations or {},
+            })
+        end
+    end)
+    return rate
+end
+
+-- Resolve Safe Area Position (Separate from player's plot!)
+local function getSafeAreaPosition()
+    local sz = Workspace:FindFirstChild("__OBJECTS")
+        and Workspace.__OBJECTS:FindFirstChild("Areas")
+        and Workspace.__OBJECTS.Areas:FindFirstChild("EggCarryBounds")
+        and Workspace.__OBJECTS.Areas.EggCarryBounds:FindFirstChild("SafeZone")
+    if sz then
+        return Vector3.new(515, sz.Position.Y + 1.5, sz.Position.Z)
+    end
+    local sa = Workspace:FindFirstChild("__OBJECTS")
+        and Workspace.__OBJECTS:FindFirstChild("Areas")
+        and Workspace.__OBJECTS.Areas:FindFirstChild("StartArea")
+    if sa then
+        return sa.Position + Vector3.new(-25, 1.5, 0)
+    end
+    return Vector3.new(500, 68, -364)
+end
+
+-- Dynamically discover all game areas (including Cherry Blossom, Titan Temple, Cosmic, Light Dark, etc.)
+local function getAvailableAreas()
+    local areaSet = {}
+    pcall(function()
+        local configs = ReplicatedStorage.Data.Areas.Configs:GetChildren()
+        for _, c in ipairs(configs) do
+            areaSet[c.Name] = true
+        end
+    end)
+    pcall(function()
+        local ga = Workspace.__OBJECTS.Areas.GuardAreas:GetChildren()
+        for _, c in ipairs(ga) do
+            areaSet[c.Name] = true
+        end
+    end)
+    pcall(function()
+        if EggState and EggState.ReadFieldEggs then
+            local data = EggState.ReadFieldEggs()
+            if data and data.Records then
+                for _, rec in pairs(data.Records) do
+                    if rec and rec.AreaId then
+                        areaSet[rec.AreaId] = true
+                    end
+                end
+            end
+        end
+    end)
+    local list = { "Any Area" }
+    local sorted = {}
+    for area in pairs(areaSet) do
+        table.insert(sorted, area)
+    end
+    table.sort(sorted)
+    for _, a in ipairs(sorted) do
+        table.insert(list, a)
+    end
+    return list
+end
+
+-- Dynamically discover all egg rarities (Common, Uncommon, Rare, Epic, Legendary, Mythic, Cosmic, etc.)
+local function getAvailableEggCategories()
+    local raritySet = {}
+    pcall(function()
+        local configs = ReplicatedStorage.Data.Assets.Configs:GetChildren()
+        for _, c in ipairs(configs) do
+            pcall(function()
+                local mod = require(c)
+                if mod and mod.Rarity then
+                    local name = type(mod.Rarity) == "table" and (mod.Rarity.DisplayName or mod.Rarity._id) or tostring(mod.Rarity)
+                    if name and name ~= "" then
+                        raritySet[name] = true
+                    end
+                end
+            end)
+        end
+    end)
+    local list = { "All" }
+    local sorted = {}
+    for r in pairs(raritySet) do
+        table.insert(sorted, r)
+    end
+    table.sort(sorted)
+    for _, r in ipairs(sorted) do
+        table.insert(list, r)
+    end
+    return list
+end
+
 
 local function setupFieldEggNetworking()
     pcall(function()
@@ -401,7 +480,7 @@ end
 local function updateStats()
     if statsParagraph then
         pcall(function()
-            statsParagraph:SetDesc(string.format("Deposited: %d  |  Collected: %d", AutoCollector.Stats.Deposited, AutoCollector.Stats.Collected))
+            statsParagraph:SetDesc(string.format("Collected: %d  |  Planted: %d", AutoCollector.Stats.Collected, AutoPlanter.Stats.Planted))
         end)
     end
 end
@@ -479,7 +558,19 @@ local function getEligibleEggs()
             -- Rarity filter
             local rarityMatch = (AutoCollector.TargetRarity == "All")
             if not rarityMatch and rec.AssetCategory then
-                if rec.AssetCategory == AutoCollector.TargetRarity then
+                local petRarity = nil
+                pcall(function()
+                    local cfg = ReplicatedStorage.Data.Assets.Configs:FindFirstChild(rec.AssetCategory)
+                    if cfg then
+                        local mod = require(cfg)
+                        if mod and mod.Rarity then
+                            petRarity = type(mod.Rarity) == "table" and (mod.Rarity.DisplayName or mod.Rarity._id) or tostring(mod.Rarity)
+                        end
+                    end
+                end)
+                if petRarity and petRarity == AutoCollector.TargetRarity then
+                    rarityMatch = true
+                elseif rec.AssetCategory == AutoCollector.TargetRarity then
                     rarityMatch = true
                 elseif rec.Mutations and #rec.Mutations > 0 then
                     for _, mut in ipairs(rec.Mutations) do
@@ -491,7 +582,22 @@ local function getEligibleEggs()
                 end
             end
 
-            if areaMatch and rarityMatch then
+            -- Steal by Value filter (Pet money income per second after hatch)
+            local valueMatch = true
+            local rate = nil
+            if AutoCollector.StealByValueEnabled then
+                rate = getEggHatchIncomePerSecond(rec)
+                if not rate then
+                    -- If the value cannot be determined yet, do not steal the egg
+                    valueMatch = false
+                elseif rate < AutoCollector.MinEggValue then
+                    valueMatch = false
+                end
+            else
+                rate = getEggHatchIncomePerSecond(rec)
+            end
+
+            if areaMatch and rarityMatch and valueMatch then
                 table.insert(list, {
                     record = rec,
                     dist = dist,
@@ -499,6 +605,8 @@ local function getEligibleEggs()
                     uid = rec.Uid,
                     name = rec.AssetCategory or "Unknown",
                     area = rec.AreaId or "World",
+                    value = rate or 0,
+                    valueFormatted = formatValue(rate or 0),
                 })
             end
         end
@@ -546,7 +654,7 @@ local function travelByTween(targetPos, stopDist)
 
     local arrived = false
 
-    while not arrived and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Tween" do
+    while not arrived and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Tween" do
         char = LocalPlayer.Character
         if not char then break end
         hrp = char:FindFirstChild("HumanoidRootPart")
@@ -579,7 +687,7 @@ local function travelByTween(targetPos, stopDist)
         local pollStart = tick()
 
         -- Check completion while allowing dynamic speed change or cancellation
-        while tick() - pollStart < duration and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Tween" do
+        while tick() - pollStart < duration and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Tween" do
             if AutoCollector.TweenSpeed ~= currentSpeedAtStart then
                 -- Speed updated mid-flight! Recalculate remaining duration with new speed
                 break
@@ -628,7 +736,7 @@ local function travelByWalk(targetPos, stopDist)
     local lastPos = hrp.Position
     local lastMoveTime = tick()
 
-    while not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Walk" do
+    while not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Walk" do
         char = LocalPlayer.Character
         if not char then break end
         hrp = char:FindFirstChild("HumanoidRootPart")
@@ -696,7 +804,7 @@ local function travelByPathfinding(targetPos, stopDist)
     if not success or path.Status ~= Enum.PathStatus.Success then
         hum:MoveTo(targetPos)
         local startTime = tick()
-        while not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Pathfinding" and (hrp.Position - targetPos).Magnitude > stopDist do
+        while not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Pathfinding" and (hrp.Position - targetPos).Magnitude > stopDist do
             if tick() - startTime > 10 then break end
             task.wait(0.2)
         end
@@ -709,7 +817,7 @@ local function travelByPathfinding(targetPos, stopDist)
     local lastMovedTime = tick()
 
     for idx, wp in ipairs(waypoints) do
-        if cancelled or not AutoCollector.Enabled or AutoCollector.MovementMethod ~= "Pathfinding" then
+        if cancelled or (not AutoCollector.Enabled and not AutoPlanter.Enabled) or AutoCollector.MovementMethod ~= "Pathfinding" then
             if hum and hrp then hum:MoveTo(hrp.Position) end
             AutoCollector.CancelCurrentMovement = nil
             return false
@@ -738,7 +846,7 @@ local function travelByPathfinding(targetPos, stopDist)
         local wpReached = false
         local wpStartTime = tick()
 
-        while not wpReached and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Pathfinding" do
+        while not wpReached and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Pathfinding" do
             local distToWp = (hrp.Position - wp.Position).Magnitude
             if distToWp <= 3.5 or (hrp.Position - targetPos).Magnitude <= stopDist then
                 wpReached = true
@@ -870,9 +978,205 @@ local function collectEgg(eggInfo)
     return false, "Collection confirmation timeout"
 end
 
-local function depositEgg(eggUid)
-    updateStatus("Navigating to pen deposit area...", "map-pin")
+local function secureCarriedEggAtSafeArea(eggUid)
+    local safePos = getSafeAreaPosition()
+    updateStatus(string.format("Returning to Safe Area (%s)...", AutoCollector.MovementMethod), "shield")
+    print("[Movement] Target changed: Safe Area")
+    print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
+    print("[Deposit] Approaching safe area")
 
+    local reached = travelTo(safePos, 8, string.format("Returning to Safe Area (%s)", AutoCollector.MovementMethod))
+    if not reached or not AutoCollector.Enabled then
+        return false, "Failed to navigate to safe area"
+    end
+
+    updateStatus("Safe Area reached - Securing egg...", "check-circle")
+    print("[Deposit] Safe area reached - Completing collection")
+
+    -- Complete normal egg collection/deposit interaction:
+    -- Unequip the egg via server remote / EggState / Humanoid
+    pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
+        if net and net:FindFirstChild("RF/EggWorld/AskDoffTool") then
+            net["RF/EggWorld/AskDoffTool"]:InvokeServer()
+        end
+    end)
+    pcall(function()
+        if EggState and EggState.DoffEggTool then
+            EggState.DoffEggTool()
+        end
+    end)
+    pcall(function()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum:UnequipTools()
+        end
+    end)
+
+    -- Wait until unequipped / carried state clears
+    local startWait = tick()
+    while tick() - startWait < 3 and AutoCollector.Enabled do
+        local carrying = isCarryingEgg()
+        if not carrying then
+            break
+        end
+        task.wait(0.1)
+    end
+
+    AutoCollector.IsCarrying = false
+    AutoCollector.CarriedEggUid = nil
+    print("[Egg] Safe area reached - Egg secured and unequipped")
+    return true
+end
+
+local function startAutoCollectLoop()
+    if AutoCollector.Thread then
+        task.cancel(AutoCollector.Thread)
+        AutoCollector.Thread = nil
+    end
+
+    AutoCollector.Thread = task.spawn(function()
+        while AutoCollector.Enabled do
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not char or not hum or hum.Health <= 0 then
+                updateStatus("Waiting for character respawn...", "alert-circle")
+                LocalPlayer.CharacterAdded:Wait()
+                task.wait(1.5)
+                continue
+            end
+
+            local carrying, tool, uid = isCarryingEgg()
+            if carrying then
+                if AutoCollector.CancelCurrentMovement then
+                    AutoCollector.CancelCurrentMovement()
+                end
+                updateStatus("Carrying egg - moving to Safe Area...", "shield")
+                local secOk, secErr = secureCarriedEggAtSafeArea(uid)
+                if secOk then
+                    AutoCollector.Stats.Collected = AutoCollector.Stats.Collected + 1
+                    updateStats()
+                    WindUI:Notify({
+                        Title = "Egg Secured!",
+                        Content = "Egg successfully secured in Safe Area!",
+                        Duration = 3,
+                        Icon = "shield-check",
+                    })
+                else
+                    updateStatus("Safe Area retry: " .. tostring(secErr), "alert-triangle")
+                    task.wait(1.5)
+                end
+                continue
+            end
+
+            updateStatus("Scanning for eligible eggs...", "search")
+            local eligible = getEligibleEggs()
+
+            if #eligible == 0 then
+                if AutoCollector.StealByValueEnabled then
+                    updateStatus(string.format("No eggs found >= %s/s. Waiting...", formatValue(AutoCollector.MinEggValue)), "clock")
+                else
+                    updateStatus("No eligible eggs found. Waiting...", "clock")
+                end
+                task.wait(2)
+                continue
+            end
+
+            local targetEgg = eligible[1]
+            AutoCollector.CurrentTarget = targetEgg
+            updateStatus(string.format("Navigating to %s ($%s/s, %d studs, %s)", targetEgg.name, targetEgg.valueFormatted, math.floor(targetEgg.dist), targetEgg.area), "navigation")
+
+            print(string.format("[Egg] Found egg: %s (Value: %s/s)", targetEgg.name or "Unknown", targetEgg.valueFormatted))
+
+            local colOk, colUid = collectEgg(targetEgg)
+            if not colOk or not AutoCollector.Enabled then
+                updateStatus("Collection unsuccessful, checking next...", "refresh-cw")
+                task.wait(1)
+                continue
+            end
+
+            -- IMMEDIATELY CANCEL EGG MOVEMENT AND SWITCH TARGET TO SAFE AREA
+            if AutoCollector.CancelCurrentMovement then
+                AutoCollector.CancelCurrentMovement()
+            end
+
+            local secOk, secErr = secureCarriedEggAtSafeArea(colUid or targetEgg.uid)
+            if secOk then
+                AutoCollector.Stats.Collected = AutoCollector.Stats.Collected + 1
+                updateStats()
+                WindUI:Notify({
+                    Title = "Egg Secured!",
+                    Content = string.format("Secured %s egg (%s, $%s/s) in Safe Area!", targetEgg.name, targetEgg.area, targetEgg.valueFormatted),
+                    Duration = 3,
+                    Icon = "shield-check",
+                })
+                updateStatus("Egg secured! Searching next egg...", "check")
+                task.wait(0.5)
+            else
+                updateStatus("Securing issue: " .. tostring(secErr), "alert-triangle")
+                task.wait(1.5)
+            end
+        end
+
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hum and hrp then
+            hum:MoveTo(hrp.Position)
+        end
+        if hrp then
+            hrp.AssemblyLinearVelocity = Vector3.new()
+        end
+        updateStatus("Idle - Auto Collect disabled", "pause")
+    end)
+end
+
+local function stopAutoCollectLoop()
+    AutoCollector.Enabled = false
+    if AutoCollector.CancelCurrentMovement then
+        AutoCollector.CancelCurrentMovement()
+    end
+    if AutoCollector.Thread then
+        task.cancel(AutoCollector.Thread)
+        AutoCollector.Thread = nil
+    end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hum and hrp then
+        hum:MoveTo(hrp.Position)
+    end
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.new()
+    end
+    updateStatus("Idle - Auto Collect disabled", "pause")
+end
+
+----------------------------------------------------------------------
+-- AUTO PLANT ENGINE (Independent Feature)
+----------------------------------------------------------------------
+
+local function getPlantableEggs()
+    local list = {}
+    local function scan(parent)
+        if not parent then return end
+        for _, item in ipairs(parent:GetChildren()) do
+            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "Asset" or item:GetAttribute("Category") or item:GetAttribute("UID")) then
+                table.insert(list, {
+                    tool = item,
+                    uid = item:GetAttribute("UID"),
+                    name = item:GetAttribute("Category") or item.Name,
+                })
+            end
+        end
+    end
+    scan(LocalPlayer:FindFirstChild("Backpack"))
+    scan(LocalPlayer.Character)
+    return list
+end
+
+local function plantEggAtPlot(eggEntry)
     local plotData = nil
     if PlotState and PlotState.ResolvePlot then
         pcall(function() plotData = PlotState.ResolvePlot() end)
@@ -916,34 +1220,28 @@ local function depositEgg(eggUid)
     end
 
     if not depositCFrame or not centerPart then
-        return false, "Plot not found"
+        return false, "Player plot not found"
     end
 
-    print("[Deposit] Approaching base")
-    local reached = travelTo(depositCFrame.Position, 5, string.format("Returning to pen (%s)", AutoCollector.MovementMethod))
-    if not reached or not AutoCollector.Enabled then
-        return false, "Failed to navigate to pen"
+    updateStatus(string.format("Planting %s in your plot (%s)...", eggEntry.name, AutoCollector.MovementMethod), "download")
+    print(string.format("[Plant] Moving to plot to plant %s", eggEntry.name))
+
+    local reached = travelTo(depositCFrame.Position, 5, string.format("Moving to plot (%s)", AutoCollector.MovementMethod))
+    if not reached or not AutoPlanter.Enabled then
+        return false, "Failed to navigate to plot"
     end
 
-    updateStatus("Depositing egg in pen...", "download")
-    print("[Deposit] Deposit requested")
-
-    local carrying, tool, uid = isCarryingEgg()
+    print("[Plant] Plot reached - Planting egg")
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local tool = eggEntry.tool
     if tool and char and hum and tool.Parent ~= char then
         hum:EquipTool(tool)
-        task.wait(0.15)
+        task.wait(0.2)
     end
 
     local localCFrame = centerPart.CFrame:ToObjectSpace(depositCFrame)
-    local targetUid = eggUid or uid or AutoCollector.CarriedEggUid
-
-    local depositConfirmed = false
-    local depConn = nil
-    depConn = DepositSignal.Event:Connect(function(payload)
-        depositConfirmed = true
-    end)
+    local targetUid = eggEntry.uid or (tool and tool:GetAttribute("UID"))
 
     pcall(function()
         if EggState and EggState.PlantEgg then
@@ -963,38 +1261,33 @@ local function depositEgg(eggUid)
         pcall(function() tool:Activate() end)
     end
 
+    -- Confirm planting succeeded: tool is consumed from backpack/character
     local startWait = tick()
-    while tick() - startWait < 4 and AutoCollector.Enabled and not depositConfirmed do
-        local stillCarrying = isCarryingEgg()
-        if not stillCarrying then
-            depositConfirmed = true
+    local confirmed = false
+    while tick() - startWait < 4 and AutoPlanter.Enabled do
+        if not tool or tool.Parent == nil or (tool.Parent ~= char and tool.Parent ~= LocalPlayer:FindFirstChild("Backpack")) then
+            confirmed = true
             break
         end
-        task.wait(0.08)
+        task.wait(0.1)
     end
 
-    if depConn then
-        depConn:Disconnect()
-    end
-
-    if depositConfirmed or not isCarryingEgg() then
-        AutoCollector.IsCarrying = false
-        AutoCollector.CarriedEggUid = nil
-        print("[Egg] Deposit confirmed")
+    if confirmed then
+        print(string.format("[Plant] Planting confirmed: %s", eggEntry.name))
         return true
     end
 
-    return false, "Deposit confirmation timeout"
+    return false, "Planting confirmation timeout"
 end
 
-local function startAutoCollectLoop()
-    if AutoCollector.Thread then
-        task.cancel(AutoCollector.Thread)
-        AutoCollector.Thread = nil
+local function startAutoPlantLoop()
+    if AutoPlanter.Thread then
+        task.cancel(AutoPlanter.Thread)
+        AutoPlanter.Thread = nil
     end
 
-    AutoCollector.Thread = task.spawn(function()
-        while AutoCollector.Enabled do
+    AutoPlanter.Thread = task.spawn(function()
+        while AutoPlanter.Enabled do
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             if not char or not hum or hum.Health <= 0 then
@@ -1004,120 +1297,43 @@ local function startAutoCollectLoop()
                 continue
             end
 
-            local carrying, tool, uid = isCarryingEgg()
-            if carrying then
-                if AutoCollector.CancelCurrentMovement then
-                    AutoCollector.CancelCurrentMovement()
-                end
-                print("[Movement] Target changed: Base")
-                print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
-                updateStatus("Carrying egg - returning to pen...", "arrow-left-circle")
-
-                local depOk, depErr = depositEgg(uid)
-                if depOk then
-                    AutoCollector.Stats.Deposited = AutoCollector.Stats.Deposited + 1
-                    updateStats()
-                    WindUI:Notify({
-                        Title = "Egg Deposited!",
-                        Content = "Egg successfully placed in pen!",
-                        Duration = 3,
-                        Icon = "check-circle",
-                    })
-                else
-                    updateStatus("Deposit retry: " .. tostring(depErr), "alert-triangle")
-                    task.wait(1.5)
-                end
-                continue
-            end
-
-            updateStatus("Scanning for eligible eggs...", "search")
-            local eligible = getEligibleEggs()
-
-            if #eligible == 0 then
-                updateStatus("No eligible eggs found. Waiting...", "clock")
+            local plantable = getPlantableEggs()
+            if #plantable == 0 then
+                updateStatus("No plantable eggs in inventory. Waiting...", "clock")
                 task.wait(2)
                 continue
             end
 
-            local targetEgg = eligible[1]
-            AutoCollector.CurrentTarget = targetEgg
-            updateStatus(string.format("Navigating to %s (%d studs, %s)", targetEgg.name, math.floor(targetEgg.dist), targetEgg.area), "navigation")
-
-            print(string.format("[Egg] Found egg: %s", targetEgg.name or "Unknown"))
-
-            local colOk, colUid = collectEgg(targetEgg)
-            if not colOk or not AutoCollector.Enabled then
-                updateStatus("Collection unsuccessful, checking next...", "refresh-cw")
-                task.wait(1)
-                continue
-            end
-
-            AutoCollector.Stats.Collected = AutoCollector.Stats.Collected + 1
-            updateStats()
-            WindUI:Notify({
-                Title = "Egg Collected!",
-                Content = string.format("Secured %s egg (%s)", targetEgg.name, targetEgg.area),
-                Duration = 2.5,
-                Icon = "egg",
-            })
-
-            -- IMMEDIATELY CANCEL EGG MOVEMENT AND SWITCH TARGET TO BASE
-            if AutoCollector.CancelCurrentMovement then
-                AutoCollector.CancelCurrentMovement()
-            end
-            print("[Movement] Target changed: Base")
-            print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
-
-            local depOk, depErr = depositEgg(colUid or targetEgg.uid)
-            if depOk then
-                AutoCollector.Stats.Deposited = AutoCollector.Stats.Deposited + 1
+            local eggToPlant = plantable[1]
+            local ok, err = plantEggAtPlot(eggToPlant)
+            if ok then
+                AutoPlanter.Stats.Planted = AutoPlanter.Stats.Planted + 1
                 updateStats()
                 WindUI:Notify({
-                    Title = "Egg Deposited!",
-                    Content = string.format("Placed %s egg into pen!", targetEgg.name),
+                    Title = "Egg Planted!",
+                    Content = string.format("Successfully planted %s in your pen! (Total: %d)", eggToPlant.name, AutoPlanter.Stats.Planted),
                     Duration = 3,
                     Icon = "check-circle",
                 })
-                updateStatus("Deposit complete! Searching next egg...", "check")
                 task.wait(0.5)
             else
-                updateStatus("Deposit issue: " .. tostring(depErr), "alert-triangle")
+                updateStatus("Plant retry: " .. tostring(err), "alert-triangle")
                 task.wait(1.5)
             end
         end
-
-        local char = LocalPlayer.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hum and hrp then
-            hum:MoveTo(hrp.Position)
-        end
-        if hrp then
-            hrp.AssemblyLinearVelocity = Vector3.new()
-        end
-        updateStatus("Idle - Auto Collect disabled", "pause")
     end)
 end
 
-local function stopAutoCollectLoop()
-    AutoCollector.Enabled = false
+local function stopAutoPlantLoop()
+    AutoPlanter.Enabled = false
     if AutoCollector.CancelCurrentMovement then
         AutoCollector.CancelCurrentMovement()
     end
-    if AutoCollector.Thread then
-        task.cancel(AutoCollector.Thread)
-        AutoCollector.Thread = nil
+    if AutoPlanter.Thread then
+        task.cancel(AutoPlanter.Thread)
+        AutoPlanter.Thread = nil
     end
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hum and hrp then
-        hum:MoveTo(hrp.Position)
-    end
-    if hrp then
-        hrp.AssemblyLinearVelocity = Vector3.new()
-    end
-    updateStatus("Idle - Auto Collect disabled", "pause")
+    updateStatus("Idle - Auto Plant disabled", "pause")
 end
 
 ----------------------------------------------------------------------
@@ -1195,7 +1411,7 @@ local MainSectionEgg = TabMain:Section({
 
 MainSectionEgg:Toggle({
     Title = "Auto Collect Eggs",
-    Desc = "Automates moving to eggs, collecting them, and depositing into your pen",
+    Desc = "Automates stealing eggs and securing them into the Safe Area",
     Value = false,
     Callback = function(state)
         AutoCollector.Enabled = state
@@ -1219,6 +1435,64 @@ MainSectionEgg:Toggle({
     end,
 })
 
+MainSectionEgg:Toggle({
+    Title = "Auto Plant Eggs",
+    Desc = "Automates planting eggs from your inventory into your plot",
+    Value = false,
+    Callback = function(state)
+        AutoPlanter.Enabled = state
+        if state then
+            startAutoPlantLoop()
+            WindUI:Notify({
+                Title = "Auto Plant Started",
+                Content = "Planting eggs from inventory into pen.",
+                Duration = 3,
+                Icon = "play",
+            })
+        else
+            stopAutoPlantLoop()
+            WindUI:Notify({
+                Title = "Auto Plant Stopped",
+                Content = "Auto plant routine halted.",
+                Duration = 2.5,
+                Icon = "square",
+            })
+        end
+    end,
+})
+
+MainSectionEgg:Toggle({
+    Title = "Steal by Value",
+    Desc = "Only steal eggs with post-hatch pet value above minimum",
+    Value = false,
+    Callback = function(state)
+        AutoCollector.StealByValueEnabled = state
+        WindUI:Notify({
+            Title = "Steal by Value",
+            Content = state and string.format("Enabled (Min: %s/s)", formatValue(AutoCollector.MinEggValue)) or "Disabled",
+            Duration = 2,
+            Icon = state and "dollar-sign" or "x",
+        })
+    end,
+})
+
+MainSectionEgg:Input({
+    Title = "Steal By Value",
+    Desc = "Minimum value; supports k, m, b",
+    Value = "0",
+    Placeholder = "e.g. 1M, 500K, 3K, 5B",
+    Callback = function(text)
+        AutoCollector.MinEggValueRaw = text
+        AutoCollector.MinEggValue = parseValueString(text)
+        WindUI:Notify({
+            Title = "Min Egg Value",
+            Content = string.format("Threshold set to: %s/sec ($%d)", formatValue(AutoCollector.MinEggValue), math.floor(AutoCollector.MinEggValue)),
+            Duration = 2,
+            Icon = "dollar-sign",
+        })
+    end,
+})
+
 statusParagraph = MainSectionEgg:Paragraph({
     Title = "Collector Status",
     Desc = "Idle - Toggle Auto Collect to begin",
@@ -1227,14 +1501,14 @@ statusParagraph = MainSectionEgg:Paragraph({
 
 statsParagraph = MainSectionEgg:Paragraph({
     Title = "Session Statistics",
-    Desc = "Deposited: 0  |  Collected: 0",
+    Desc = "Collected: 0  |  Planted: 0",
     Image = "bar-chart-2",
 })
 
 MainSectionEgg:Dropdown({
     Title = "Target Area Filter",
     Desc = "Limit collection to specific world areas",
-    Values = { "Any Area", "Forest", "Lake", "Snow", "Volcano", "Cosmic" },
+    Values = getAvailableAreas(),
     Value = "Any Area",
     Callback = function(selected)
         AutoCollector.TargetArea = selected
@@ -1250,7 +1524,7 @@ MainSectionEgg:Dropdown({
 MainSectionEgg:Dropdown({
     Title = "Target Egg Rarity",
     Desc = "Filter which egg rarity to monitor",
-    Values = { "All", "Common", "Rare", "Epic", "Legendary" },
+    Values = getAvailableEggCategories(),
     Value = "All",
     Callback = function(selected)
         AutoCollector.TargetRarity = selected
@@ -1263,79 +1537,6 @@ MainSectionEgg:Dropdown({
     end,
 })
 
-MainSectionEgg:Toggle({
-    Title = "Egg Detection Alert",
-    Desc = "Notifies when collectibles spawn or are nearby",
-    Value = false,
-    Callback = function(state)
-        WindUI:Notify({
-            Title = "Egg Alert",
-            Content = state and "Egg alerts enabled" or "Egg alerts disabled",
-            Duration = 2,
-            Icon = state and "bell" or "bell-off",
-        })
-    end,
-})
-
-MainSectionEgg:Slider({
-    Title = "Alert Distance (Studs)",
-    Desc = "Distance threshold for egg notifications",
-    Value = {
-        Min = 10,
-        Max = 200,
-        Default = 50,
-    },
-    Step = 5,
-    Callback = function(val)
-        -- Notification distance threshold
-    end,
-})
-
-----------------------------------------------------------------------
--- TAB 3: VISUALS (Ready for ESP / Display features)
-----------------------------------------------------------------------
-local TabVisuals = Window:Tab({
-    Title = "Visuals",
-    Icon = "eye",
-})
-
-local VisualsSectionEsp = TabVisuals:Section({
-    Title = "ESP & Highlights",
-    Icon = "scan",
-    Opened = true,
-})
-
-VisualsSectionEsp:Toggle({
-    Title = "Player Highlights",
-    Desc = "Draw highlight boxes around players",
-    Value = false,
-    Callback = function(state)
-        WindUI:Notify({
-            Title = "Highlights",
-            Content = state and "Highlights enabled" or "Highlights disabled",
-            Duration = 2,
-            Icon = "eye",
-        })
-    end,
-})
-
-VisualsSectionEsp:Toggle({
-    Title = "Name Tags",
-    Desc = "Show player display names and health",
-    Value = false,
-    Callback = function(state)
-        -- Placeholder
-    end,
-})
-
-VisualsSectionEsp:Colorpicker({
-    Title = "Highlight Color",
-    Desc = "Choose outline color for visual elements",
-    Default = Color3.fromRGB(0, 180, 216),
-    Callback = function(color)
-        -- Placeholder
-    end,
-})
 
 ----------------------------------------------------------------------
 -- TAB 4: SETTINGS & CUSTOMIZATION
@@ -1351,10 +1552,21 @@ local SettingsSectionUI = TabSettings:Section({
     Opened = true,
 })
 
+local availableThemes = {}
+pcall(function()
+    for tName in pairs(WindUI:GetThemes()) do
+        table.insert(availableThemes, tName)
+    end
+    table.sort(availableThemes)
+end)
+if #availableThemes == 0 then
+    availableThemes = { "Dark", "Light", "Sky", "Midnight", "Rose", "Emerald" }
+end
+
 SettingsSectionUI:Dropdown({
     Title = "Theme",
     Desc = "Switch UI appearance style",
-    Values = WindUI:GetThemes(),
+    Values = availableThemes,
     Value = WindUI:GetCurrentTheme(),
     Callback = function(theme)
         Window:SetTheme(theme)
