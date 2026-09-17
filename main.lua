@@ -38,7 +38,7 @@ if WindUI and WindUI.Creator and WindUI.Creator.UpdateFont then
 end
 
 -- Fetch Game Name safely
-local gameName = "Universal"
+local gameName = "Steal An Egg"
 pcall(function()
     local productInfo = MarketplaceService:GetProductInfo(game.PlaceId)
     if productInfo and productInfo.Name then
@@ -48,7 +48,7 @@ end)
 
 -- Create Main Window
 local Window = WindUI:CreateWindow({
-    Title = "Frost Hub",
+    Title = string.format("Frost Hub, %s Script", gameName),
     Author = "by Frost Team",
     Icon = "snowflake",
     Folder = "FrostHub",
@@ -91,13 +91,8 @@ local Window = WindUI:CreateWindow({
 
 -- Topbar Tags
 Window:Tag({
-    Title = "v1.0.0",
+    Title = "V 0.0.1",
     Color = Color3.fromHex("#00b4d8"),
-})
-
-Window:Tag({
-    Title = "Universal",
-    Color = Color3.fromHex("#48cae4"),
 })
 
 -- Initial Load Notification
@@ -229,8 +224,9 @@ local AutoCollector = {
     TargetArea = "Any Area",
     TargetRarity = "All",
     MovementMethod = "Pathfinding", -- "Pathfinding", "Walk", "Tween"
-    TweenSpeed = 45,
-    WalkSpeed = 16,
+    TweenSpeed = 60,
+    WalkSpeed = 24,
+    PathfindingSpeed = 32,
     CancelCurrentMovement = nil,
     IsCarrying = false,
     CarriedEggUid = nil,
@@ -453,17 +449,38 @@ task.spawn(setupFieldEggNetworking)
 
 local statusParagraph = nil
 local statsParagraph = nil
+
+-- Movement UI element handles
 local tweenSpeedSlider = nil
+local tweenSpeedInput = nil
+local tweenPresetDropdown = nil
 local walkSpeedSlider = nil
+local walkSpeedInput = nil
+local walkPresetDropdown = nil
+local pathSpeedSlider = nil
+local pathSpeedInput = nil
+local pathPresetDropdown = nil
 
 local function updateMovementUIVisibility()
-    local isTween = (AutoCollector.MovementMethod == "Tween")
-    if tweenSpeedSlider and tweenSpeedSlider.ElementFrame then
-        tweenSpeedSlider.ElementFrame.Visible = isTween
-    end
-    if walkSpeedSlider and walkSpeedSlider.ElementFrame then
-        walkSpeedSlider.ElementFrame.Visible = not isTween
-    end
+    local method = AutoCollector.MovementMethod
+    local isTween = (method == "Tween")
+    local isWalk = (method == "Walk")
+    local isPath = (method == "Pathfinding")
+
+    -- Tween controls
+    if tweenSpeedSlider and tweenSpeedSlider.ElementFrame then tweenSpeedSlider.ElementFrame.Visible = isTween end
+    if tweenSpeedInput and tweenSpeedInput.ElementFrame then tweenSpeedInput.ElementFrame.Visible = isTween end
+    if tweenPresetDropdown and tweenPresetDropdown.ElementFrame then tweenPresetDropdown.ElementFrame.Visible = isTween end
+
+    -- Walk controls
+    if walkSpeedSlider and walkSpeedSlider.ElementFrame then walkSpeedSlider.ElementFrame.Visible = isWalk end
+    if walkSpeedInput and walkSpeedInput.ElementFrame then walkSpeedInput.ElementFrame.Visible = isWalk end
+    if walkPresetDropdown and walkPresetDropdown.ElementFrame then walkPresetDropdown.ElementFrame.Visible = isWalk end
+
+    -- Pathfinding controls
+    if pathSpeedSlider and pathSpeedSlider.ElementFrame then pathSpeedSlider.ElementFrame.Visible = isPath end
+    if pathSpeedInput and pathSpeedInput.ElementFrame then pathSpeedInput.ElementFrame.Visible = isPath end
+    if pathPresetDropdown and pathPresetDropdown.ElementFrame then pathPresetDropdown.ElementFrame.Visible = isPath end
 end
 
 local function updateStatus(text, icon)
@@ -782,7 +799,7 @@ local function travelByPathfinding(targetPos, stopDist)
         return true
     end
 
-    hum.WalkSpeed = AutoCollector.WalkSpeed
+    hum.WalkSpeed = AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed or 32
 
     local cancelled = false
     AutoCollector.CancelCurrentMovement = function()
@@ -835,7 +852,7 @@ local function travelByPathfinding(targetPos, stopDist)
             return true
         end
 
-        hum.WalkSpeed = AutoCollector.WalkSpeed
+        hum.WalkSpeed = AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed or 32
 
         if wp.Action == Enum.PathWaypointAction.Jump then
             hum.Jump = true
@@ -1366,29 +1383,69 @@ MainSectionMovement:Dropdown({
     end,
 })
 
+-- 1. Tween Speed Controls
 tweenSpeedSlider = MainSectionMovement:Slider({
     Title = "Tween Speed",
     Desc = "Studs per second during tween travel",
     Value = {
         Min = 10,
-        Max = 200,
-        Default = 45,
+        Max = 1000,
+        Default = 60,
     },
-    Step = 1,
+    Step = 5,
     Callback = function(val)
         AutoCollector.TweenSpeed = val
     end,
 })
 
+tweenSpeedInput = MainSectionMovement:Input({
+    Title = "Custom Tween Speed",
+    Desc = "Enter exact studs per second",
+    Value = "60",
+    Placeholder = "e.g. 150, 300, 600, 1000",
+    Callback = function(text)
+        local num = tonumber(text:match("%d+"))
+        if num and num > 0 then
+            AutoCollector.TweenSpeed = num
+            WindUI:Notify({
+                Title = "Tween Speed",
+                Content = string.format("Set to %d studs/s", num),
+                Duration = 2,
+                Icon = "zap",
+            })
+        end
+    end,
+})
+
+tweenPresetDropdown = MainSectionMovement:Dropdown({
+    Title = "Tween Speed Presets",
+    Desc = "Quick select travel speed",
+    Values = { "Slow (30)", "Normal (60)", "Fast (120)", "Turbo (250)", "Supersonic (500)", "Insane (1000)" },
+    Value = "Normal (60)",
+    Callback = function(selected)
+        local num = tonumber(selected:match("%((%d+)%)"))
+        if num then
+            AutoCollector.TweenSpeed = num
+            WindUI:Notify({
+                Title = "Tween Speed",
+                Content = string.format("Preset: %s (%d studs/s)", selected, num),
+                Duration = 2,
+                Icon = "zap",
+            })
+        end
+    end,
+})
+
+-- 2. Walk Speed Controls
 walkSpeedSlider = MainSectionMovement:Slider({
     Title = "Walk Speed Changer",
     Desc = "Adjust character walk speed for movement testing",
     Value = {
         Min = 16,
-        Max = 200,
-        Default = 16,
+        Max = 500,
+        Default = 24,
     },
-    Step = 1,
+    Step = 2,
     Callback = function(val)
         AutoCollector.WalkSpeed = val
         if LocalPlayer.Character then
@@ -1396,6 +1453,119 @@ walkSpeedSlider = MainSectionMovement:Slider({
             if hum then
                 hum.WalkSpeed = val
             end
+        end
+    end,
+})
+
+walkSpeedInput = MainSectionMovement:Input({
+    Title = "Custom Walk Speed",
+    Desc = "Enter exact walk speed value",
+    Value = "24",
+    Placeholder = "e.g. 35, 80, 150, 300",
+    Callback = function(text)
+        local num = tonumber(text:match("%d+"))
+        if num and num >= 16 then
+            AutoCollector.WalkSpeed = num
+            if LocalPlayer.Character then
+                local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum.WalkSpeed = num end
+            end
+            WindUI:Notify({
+                Title = "Walk Speed",
+                Content = string.format("Set to %d", num),
+                Duration = 2,
+                Icon = "activity",
+            })
+        end
+    end,
+})
+
+walkPresetDropdown = MainSectionMovement:Dropdown({
+    Title = "Walk Speed Presets",
+    Desc = "Quick select walk speed",
+    Values = { "Default (16)", "Brisk (24)", "Fast (45)", "Sprint (80)", "Super (150)", "Speedster (300)" },
+    Value = "Brisk (24)",
+    Callback = function(selected)
+        local num = tonumber(selected:match("%((%d+)%)"))
+        if num then
+            AutoCollector.WalkSpeed = num
+            if LocalPlayer.Character then
+                local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum.WalkSpeed = num end
+            end
+            WindUI:Notify({
+                Title = "Walk Speed",
+                Content = string.format("Preset: %s", selected),
+                Duration = 2,
+                Icon = "activity",
+            })
+        end
+    end,
+})
+
+-- 3. Pathfinding Speed Controls
+pathSpeedSlider = MainSectionMovement:Slider({
+    Title = "Pathfinding Speed",
+    Desc = "Character speed while navigating waypoints",
+    Value = {
+        Min = 16,
+        Max = 500,
+        Default = 32,
+    },
+    Step = 2,
+    Callback = function(val)
+        AutoCollector.PathfindingSpeed = val
+        if LocalPlayer.Character and AutoCollector.MovementMethod == "Pathfinding" then
+            local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = val
+            end
+        end
+    end,
+})
+
+pathSpeedInput = MainSectionMovement:Input({
+    Title = "Custom Pathfinding Speed",
+    Desc = "Enter exact pathfinding speed value",
+    Value = "32",
+    Placeholder = "e.g. 40, 75, 150, 300",
+    Callback = function(text)
+        local num = tonumber(text:match("%d+"))
+        if num and num >= 16 then
+            AutoCollector.PathfindingSpeed = num
+            if LocalPlayer.Character and AutoCollector.MovementMethod == "Pathfinding" then
+                local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum.WalkSpeed = num end
+            end
+            WindUI:Notify({
+                Title = "Pathfinding Speed",
+                Content = string.format("Set to %d", num),
+                Duration = 2,
+                Icon = "navigation",
+            })
+        end
+    end,
+})
+
+pathPresetDropdown = MainSectionMovement:Dropdown({
+    Title = "Pathfinding Speed Presets",
+    Desc = "Quick select pathfinding speed",
+    Values = { "Cautious (16)", "Normal (28)", "Optimal (45)", "Sprint (75)", "Rapid (120)", "High-Speed (250)" },
+    Value = "Normal (28)",
+    Callback = function(selected)
+        local num = tonumber(selected:match("%((%d+)%)"))
+        if num then
+            AutoCollector.PathfindingSpeed = num
+            if LocalPlayer.Character and AutoCollector.MovementMethod == "Pathfinding" then
+                local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum.WalkSpeed = num end
+            end
+            WindUI:Notify({
+                Title = "Pathfinding Speed",
+                Content = string.format("Preset: %s", selected),
+                Duration = 2,
+                Icon = "navigation",
+            })
         end
     end,
 })
