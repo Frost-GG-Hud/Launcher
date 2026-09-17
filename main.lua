@@ -5,6 +5,12 @@
     ╚═══════════════════════════════════════════════════════════╝
 ]]
 
+-- Clean up any previous Frost Hub instances before launching
+if _G.FrostHubCleanup then
+    pcall(_G.FrostHubCleanup)
+    _G.FrostHubCleanup = nil
+end
+
 -- Load WindUI Library
 local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
 
@@ -247,6 +253,29 @@ local AutoPlanter = {
     },
     Thread = nil,
 }
+
+_G.FrostHubCleanup = function()
+    if AutoCollector then
+        AutoCollector.Enabled = false
+        if AutoCollector.CancelCurrentMovement then
+            pcall(AutoCollector.CancelCurrentMovement)
+        end
+        if AutoCollector.Thread then
+            pcall(task.cancel, AutoCollector.Thread)
+            AutoCollector.Thread = nil
+        end
+    end
+    if AutoPlanter then
+        AutoPlanter.Enabled = false
+        if AutoPlanter.Thread then
+            pcall(task.cancel, AutoPlanter.Thread)
+            AutoPlanter.Thread = nil
+        end
+    end
+    if Window and Window.Destroy then
+        pcall(function() Window:Destroy() end)
+    end
+end
 
 -- Value Parsing & Formatting Helpers (Supports K, M, B, T)
 local function parseValueString(str)
@@ -498,33 +527,7 @@ local function updateStats()
 end
 
 local function isCarryingEgg()
-    if AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
-        return true, nil, AutoCollector.CarriedEggUid
-    end
-
-    local char = LocalPlayer.Character
-    if char then
-        for _, item in ipairs(char:GetChildren()) do
-            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item:GetAttribute("UID") or item.Name:lower():find("egg")) then
-                local uid = item:GetAttribute("UID") or "carried_egg"
-                AutoCollector.IsCarrying = true
-                AutoCollector.CarriedEggUid = uid
-                return true, item, uid
-            end
-        end
-    end
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if bp then
-        for _, item in ipairs(bp:GetChildren()) do
-            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item:GetAttribute("UID") or item.Name:lower():find("egg")) then
-                local uid = item:GetAttribute("UID") or "carried_egg"
-                AutoCollector.IsCarrying = true
-                AutoCollector.CarriedEggUid = uid
-                return true, item, uid
-            end
-        end
-    end
-
+    -- 1. Check live field egg snapshot from server (authoritative)
     if EggState and EggState.ReadFieldEggs then
         local eggsData = nil
         pcall(function() eggsData = EggState.ReadFieldEggs() end)
@@ -535,6 +538,21 @@ local function isCarryingEgg()
                     AutoCollector.CarriedEggUid = rec.Uid
                     return true, nil, rec.Uid
                 end
+            end
+        end
+    end
+
+    -- 2. Check live event state flag
+    if AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
+        return true, nil, AutoCollector.CarriedEggUid
+    end
+
+    -- 3. Check character equipped tool (only if actively held and is an AssetEgg, never backpack inventory)
+    local char = LocalPlayer.Character
+    if char and AutoCollector.CarriedEggUid then
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and (item:GetAttribute("UID") == AutoCollector.CarriedEggUid or item:GetAttribute("ItemType") == "AssetEgg") then
+                return true, item, AutoCollector.CarriedEggUid
             end
         end
     end
