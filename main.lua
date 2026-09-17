@@ -272,6 +272,10 @@ _G.FrostHubCleanup = function()
             AutoPlanter.Thread = nil
         end
     end
+    local elevatedPlatform = Workspace:FindFirstChild("FrostHub_ElevatedPlatform")
+    if elevatedPlatform then
+        pcall(function() elevatedPlatform:Destroy() end)
+    end
     if Window and Window.Destroy then
         pcall(function() Window:Destroy() end)
     end
@@ -986,77 +990,62 @@ local function travelTo(targetPos, stopDist, statusText, isApproachingEgg)
 end
 
 ----------------------------------------------------------------------
--- EGG COLLECTION & DEPOSIT (With Guard Escape Route)
+-- EGG COLLECTION & DEPOSIT (Elevated Stand Platform)
 ----------------------------------------------------------------------
 
--- Resolves the designated escape point for an area where the guard cannot catch the player
-local function getAreaExitPoint(areaName, eggPos)
-    local ga = Workspace:FindFirstChild("__OBJECTS")
-        and Workspace.__OBJECTS:FindFirstChild("Areas")
-        and Workspace.__OBJECTS.Areas:FindFirstChild("GuardAreas")
-    if not ga then return nil end
-
-    if areaName and areaName ~= "Any Area" then
-        local areaFolder = ga:FindFirstChild(areaName)
-        if areaFolder and areaFolder:FindFirstChild("ClosestExitPoint") then
-            local exit = areaFolder.ClosestExitPoint
-            if exit:IsA("BasePart") then
-                return exit.Position
-            end
-        end
+-- Creates or ensures the invisible platform above the stands where guards cannot reach
+local function ensureElevatedPlatform()
+    local platform = Workspace:FindFirstChild("FrostHub_ElevatedPlatform")
+    if not platform or not platform.Parent then
+        platform = Instance.new("Part")
+        platform.Name = "FrostHub_ElevatedPlatform"
+        platform.Size = Vector3.new(140, 2, 460)
+        platform.Position = Vector3.new(500, 100, -364)
+        platform.Anchored = true
+        platform.CanCollide = true
+        platform.Transparency = 1
+        platform.CastShadow = false
+        platform.Material = Enum.Material.SmoothPlastic
+        platform.Parent = Workspace
     end
+    return platform
+end
 
-    if eggPos then
-        local closestExit = nil
-        local closestDist = math.huge
-        for _, a in ipairs(ga:GetChildren()) do
-            local exit = a:FindFirstChild("ClosestExitPoint")
-            if exit and exit:IsA("BasePart") then
-                local d = (exit.Position - eggPos).Magnitude
-                if d < closestDist then
-                    closestDist = d
-                    closestExit = exit.Position
-                end
-            end
-        end
-        return closestExit
+local function teleportToElevatedPlatform()
+    ensureElevatedPlatform()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.new()
+        hrp.AssemblyAngularVelocity = Vector3.new()
+        hrp.CFrame = CFrame.new(500, 103, -364)
     end
-
-    return nil
 end
 
 local function collectEgg(eggInfo)
     local targetPos = eggInfo.pos
-    local exitPos = getAreaExitPoint(eggInfo.area, targetPos)
 
-    -- 1. Approach the egg from the direction of the safe exit to avoid walking into the guard
-    local approachPos = targetPos
-    if exitPos then
-        local toExit = (exitPos - targetPos).Unit
-        approachPos = targetPos + Vector3.new(toExit.X * 5.2, 0.5, toExit.Z * 5.2)
-    end
+    local reached = travelTo(targetPos, 4.5, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod), true)
 
-    local reached = travelTo(approachPos, 4.5, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod), true)
-
-    if AutoCollector.IsCarrying then
+    local function handleCarriedEgg(uid)
         print("[AutoCollect] Egg equipped")
         print("[AutoCollect] State = Carried")
-        if exitPos then
-            updateStatus(string.format("Escaping %s Guard...", eggInfo.area or "Area"), "shield")
-            travelTo(exitPos, 5, "Escaping Guard", false)
+        if AutoCollector.CancelCurrentMovement then
+            AutoCollector.CancelCurrentMovement()
         end
-        return true, AutoCollector.CarriedEggUid or eggInfo.uid
+        updateStatus("Egg carried! Teleporting above stands...", "shield")
+        teleportToElevatedPlatform()
+        return true, uid
+    end
+
+    if AutoCollector.IsCarrying then
+        return handleCarriedEgg(AutoCollector.CarriedEggUid or eggInfo.uid)
     end
 
     if not reached or not AutoCollector.Enabled then
         local carrying, _, uid = isCarryingEgg()
         if carrying or AutoCollector.IsCarrying then
-            print("[AutoCollect] Egg equipped")
-            print("[AutoCollect] State = Carried")
-            if exitPos then
-                travelTo(exitPos, 5, "Escaping Guard", false)
-            end
-            return true, uid or AutoCollector.CarriedEggUid or eggInfo.uid
+            return handleCarriedEgg(uid or AutoCollector.CarriedEggUid or eggInfo.uid)
         end
         return false, "Failed to navigate to egg"
     end
@@ -1065,7 +1054,7 @@ local function collectEgg(eggInfo)
 
     local eggUidStr = tostring(eggInfo.uid)
 
-    -- 2. Fast ProximityPrompt trigger
+    -- Fast ProximityPrompt trigger
     for _, part in ipairs(Workspace:GetChildren()) do
         if part.Name == "SmartPromptPart" and (part.Position - targetPos).Magnitude <= 15 then
             local prompt = part:FindFirstChild("CarryAreaEgg")
@@ -1086,7 +1075,7 @@ local function collectEgg(eggInfo)
         end
     end
 
-    -- 3. Server carry invocation with string Uid
+    -- Server carry invocation with string Uid
     pcall(function()
         local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
         if net and net:FindFirstChild("RF/EggWorld/AskFieldEggCarry") then
@@ -1099,16 +1088,7 @@ local function collectEgg(eggInfo)
         end
     end)
 
-    -- 4. IMMEDIATELY EVADE TOWARDS EXIT POINT (where the guard cannot catch you)
-    -- DO NOT linger in front of the guard!
-    if exitPos then
-        updateStatus(string.format("Escaping %s Guard to Safe Exit...", eggInfo.area or "Area"), "shield")
-        task.spawn(function()
-            travelTo(exitPos, 5, "Escaping Guard Area", false)
-        end)
-    end
-
-    -- 5. Event-driven wait for carried state confirmation
+    -- Event-driven wait for carried state confirmation
     local carryConfirmed = false
     local carryConn = nil
 
@@ -1131,37 +1111,29 @@ local function collectEgg(eggInfo)
     end
 
     if carryConfirmed or AutoCollector.IsCarrying then
-        print("[AutoCollect] Egg equipped")
-        print("[AutoCollect] State = Carried")
-
-        -- Complete escape to safe exit point where the guard cannot catch you
-        if exitPos then
-            updateStatus("Clearing guard area via exit...", "shield")
-            travelTo(exitPos, 5, "Escaping Guard Area", false)
-        end
-
-        return true, AutoCollector.CarriedEggUid or eggInfo.uid
+        return handleCarriedEgg(AutoCollector.CarriedEggUid or eggInfo.uid)
     end
 
     return false, "Collection confirmation timeout"
 end
 
-local function secureCarriedEggAtSafeArea(eggUid, areaName, eggPos)
+local function secureCarriedEggAtSafeArea(eggUid)
     local safePos = getSafeAreaPosition()
-    local exitPos = getAreaExitPoint(areaName, eggPos)
-
-    -- Ensure we have fully cleared the guard area before proceeding across the map
-    if exitPos then
-        local char = LocalPlayer.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp and (hrp.Position - exitPos).Magnitude > 12 then
-            updateStatus("Clearing guard area via safe exit...", "shield")
-            travelTo(exitPos, 5, "Escaping Guard", false)
-        end
-    end
 
     print("[AutoCollect] Target = Safe Area")
     updateStatus(string.format("Returning to Safe Area (%s)...", AutoCollector.MovementMethod), "shield")
+
+    -- Bring character safely down from the elevated platform into the Safe Area
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.new()
+        hrp.AssemblyAngularVelocity = Vector3.new()
+        if hrp.Position.Y > 85 then
+            hrp.CFrame = CFrame.new(safePos)
+            task.wait(0.2)
+        end
+    end
 
     local reached = travelTo(safePos, 8, string.format("Returning to Safe Area (%s)", AutoCollector.MovementMethod), false)
     if not reached or not AutoCollector.Enabled then
@@ -1185,8 +1157,8 @@ local function secureCarriedEggAtSafeArea(eggUid, areaName, eggPos)
         end
     end)
     pcall(function()
-        local char = LocalPlayer.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local c = LocalPlayer.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
         if hum then
             hum:UnequipTools()
         end
@@ -1282,7 +1254,7 @@ local function startAutoCollectLoop()
                 AutoCollector.CancelCurrentMovement()
             end
 
-            local secOk, secErr = secureCarriedEggAtSafeArea(colUid or targetEgg.uid, targetEgg.area, targetEgg.pos)
+            local secOk, secErr = secureCarriedEggAtSafeArea(colUid or targetEgg.uid)
             if secOk then
                 AutoCollector.Stats.Collected = AutoCollector.Stats.Collected + 1
                 updateStats()
