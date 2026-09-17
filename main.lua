@@ -12,6 +12,7 @@ local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/rel
 local Players = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
 local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -273,7 +274,7 @@ MainSectionWorld:Dropdown({
 })
 
 ----------------------------------------------------------------------
--- AUTO EGG COLLECTOR ENGINE
+-- AUTO EGG COLLECTOR & MOVEMENT ENGINE
 ----------------------------------------------------------------------
 local EggState
 pcall(function()
@@ -299,6 +300,10 @@ local AutoCollector = {
     CurrentTarget = nil,
     TargetArea = "Any Area",
     TargetRarity = "All",
+    MovementMethod = "Pathfinding", -- "Pathfinding", "Walk", "Tween"
+    TweenSpeed = 45,
+    WalkSpeed = 16,
+    CancelCurrentMovement = nil,
     Stats = {
         Collected = 0,
         Deposited = 0,
@@ -308,6 +313,18 @@ local AutoCollector = {
 
 local statusParagraph = nil
 local statsParagraph = nil
+local tweenSpeedSlider = nil
+local walkSpeedSlider = nil
+
+local function updateMovementUIVisibility()
+    local isTween = (AutoCollector.MovementMethod == "Tween")
+    if tweenSpeedSlider and tweenSpeedSlider.ElementFrame then
+        tweenSpeedSlider.ElementFrame.Visible = isTween
+    end
+    if walkSpeedSlider and walkSpeedSlider.ElementFrame then
+        walkSpeedSlider.ElementFrame.Visible = not isTween
+    end
+end
 
 local function updateStatus(text, icon)
     if statusParagraph then
@@ -409,7 +426,161 @@ local function getEligibleEggs()
     return list
 end
 
-local function walkTo(targetPos, stopDist)
+----------------------------------------------------------------------
+-- NAVIGATION STRATEGIES (Tween, Walk, Pathfinding)
+----------------------------------------------------------------------
+
+-- 1. Tween Navigation
+local function travelByTween(targetPos, stopDist)
+    stopDist = stopDist or 5
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return false end
+
+    local destPos = targetPos + Vector3.new(0, 1.5, 0)
+    local dist = (hrp.Position - destPos).Magnitude
+    if dist <= stopDist then return true end
+
+    local activeTween = nil
+    local cancelled = false
+
+    local function stopActiveTween()
+        if activeTween then
+            activeTween:Cancel()
+            activeTween = nil
+        end
+        if hrp and hrp.Parent then
+            hrp.AssemblyLinearVelocity = Vector3.new()
+            hrp.AssemblyAngularVelocity = Vector3.new()
+        end
+    end
+
+    AutoCollector.CancelCurrentMovement = function()
+        cancelled = true
+        stopActiveTween()
+    end
+
+    local arrived = false
+
+    while not arrived and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Tween" do
+        char = LocalPlayer.Character
+        if not char then break end
+        hrp = char:FindFirstChild("HumanoidRootPart")
+        hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then break end
+
+        local remainingDist = (hrp.Position - destPos).Magnitude
+        if remainingDist <= stopDist then
+            arrived = true
+            break
+        end
+
+        local speed = math.max(1, AutoCollector.TweenSpeed)
+        local duration = remainingDist / speed
+
+        stopActiveTween()
+        hrp.AssemblyLinearVelocity = Vector3.new()
+
+        local direction = (destPos - hrp.Position).Unit
+        local targetCFrame = CFrame.new(destPos, destPos + direction)
+
+        activeTween = TweenService:Create(
+            hrp,
+            TweenInfo.new(duration, Enum.EasingStyle.Linear),
+            { CFrame = targetCFrame }
+        )
+        activeTween:Play()
+
+        local currentSpeedAtStart = speed
+        local pollStart = tick()
+
+        -- Check completion while allowing dynamic speed change or cancellation
+        while tick() - pollStart < duration and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Tween" do
+            if AutoCollector.TweenSpeed ~= currentSpeedAtStart then
+                -- Speed updated mid-flight! Recalculate remaining duration with new speed
+                break
+            end
+            if (hrp.Position - destPos).Magnitude <= stopDist then
+                arrived = true
+                break
+            end
+            task.wait(0.04)
+        end
+
+        if (hrp.Position - destPos).Magnitude <= stopDist then
+            arrived = true
+            break
+        end
+    end
+
+    stopActiveTween()
+    AutoCollector.CancelCurrentMovement = nil
+
+    if hrp and hrp.Parent then
+        hrp.AssemblyLinearVelocity = Vector3.new()
+    end
+
+    return arrived
+end
+
+-- 2. Direct Walk Navigation
+local function travelByWalk(targetPos, stopDist)
+    stopDist = stopDist or 5
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return false end
+
+    local cancelled = false
+    AutoCollector.CancelCurrentMovement = function()
+        cancelled = true
+        if hum and hrp then hum:MoveTo(hrp.Position) end
+    end
+
+    hum.WalkSpeed = AutoCollector.WalkSpeed
+    hum:MoveTo(targetPos)
+
+    local lastPos = hrp.Position
+    local lastMoveTime = tick()
+
+    while not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Walk" do
+        char = LocalPlayer.Character
+        if not char then break end
+        hrp = char:FindFirstChild("HumanoidRootPart")
+        hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum or hum.Health <= 0 then break end
+
+        local dist = (hrp.Position - targetPos).Magnitude
+        if dist <= stopDist then
+            hum:MoveTo(hrp.Position)
+            AutoCollector.CancelCurrentMovement = nil
+            return true
+        end
+
+        hum.WalkSpeed = AutoCollector.WalkSpeed
+        hum:MoveTo(targetPos)
+
+        if (hrp.Position - lastPos).Magnitude > 0.8 then
+            lastPos = hrp.Position
+            lastMoveTime = tick()
+        elseif tick() - lastMoveTime > 1.5 then
+            hum.Jump = true
+            lastMoveTime = tick()
+        end
+
+        task.wait(0.1)
+    end
+
+    if hum and hrp then hum:MoveTo(hrp.Position) end
+    AutoCollector.CancelCurrentMovement = nil
+    return (hrp.Position - targetPos).Magnitude <= (stopDist + 2)
+end
+
+-- 3. Pathfinding Navigation
+local function travelByPathfinding(targetPos, stopDist)
     stopDist = stopDist or 5
     local char = LocalPlayer.Character
     if not char then return false end
@@ -419,6 +590,14 @@ local function walkTo(targetPos, stopDist)
 
     if (hrp.Position - targetPos).Magnitude <= stopDist then
         return true
+    end
+
+    hum.WalkSpeed = AutoCollector.WalkSpeed
+
+    local cancelled = false
+    AutoCollector.CancelCurrentMovement = function()
+        cancelled = true
+        if hum and hrp then hum:MoveTo(hrp.Position) end
     end
 
     local path = PathfindingService:CreatePath({
@@ -435,10 +614,11 @@ local function walkTo(targetPos, stopDist)
     if not success or path.Status ~= Enum.PathStatus.Success then
         hum:MoveTo(targetPos)
         local startTime = tick()
-        while AutoCollector.Enabled and (hrp.Position - targetPos).Magnitude > stopDist do
+        while not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Pathfinding" and (hrp.Position - targetPos).Magnitude > stopDist do
             if tick() - startTime > 10 then break end
             task.wait(0.2)
         end
+        AutoCollector.CancelCurrentMovement = nil
         return (hrp.Position - targetPos).Magnitude <= (stopDist + 3)
     end
 
@@ -447,21 +627,25 @@ local function walkTo(targetPos, stopDist)
     local lastMovedTime = tick()
 
     for idx, wp in ipairs(waypoints) do
-        if not AutoCollector.Enabled then
-            hum:MoveTo(hrp.Position)
+        if cancelled or not AutoCollector.Enabled or AutoCollector.MovementMethod ~= "Pathfinding" then
+            if hum and hrp then hum:MoveTo(hrp.Position) end
+            AutoCollector.CancelCurrentMovement = nil
             return false
         end
 
         char = LocalPlayer.Character
-        if not char then return false end
+        if not char then break end
         hrp = char:FindFirstChild("HumanoidRootPart")
         hum = char:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum or hum.Health <= 0 then return false end
+        if not hrp or not hum or hum.Health <= 0 then break end
 
         if (hrp.Position - targetPos).Magnitude <= stopDist then
             hum:MoveTo(hrp.Position)
+            AutoCollector.CancelCurrentMovement = nil
             return true
         end
+
+        hum.WalkSpeed = AutoCollector.WalkSpeed
 
         if wp.Action == Enum.PathWaypointAction.Jump then
             hum.Jump = true
@@ -472,7 +656,7 @@ local function walkTo(targetPos, stopDist)
         local wpReached = false
         local wpStartTime = tick()
 
-        while not wpReached and AutoCollector.Enabled do
+        while not wpReached and not cancelled and AutoCollector.Enabled and AutoCollector.MovementMethod == "Pathfinding" do
             local distToWp = (hrp.Position - wp.Position).Magnitude
             if distToWp <= 3.5 or (hrp.Position - targetPos).Magnitude <= stopDist then
                 wpReached = true
@@ -496,13 +680,33 @@ local function walkTo(targetPos, stopDist)
         end
     end
 
-    hum:MoveTo(hrp.Position)
+    if hum and hrp then hum:MoveTo(hrp.Position) end
+    AutoCollector.CancelCurrentMovement = nil
     return (hrp.Position - targetPos).Magnitude <= (stopDist + 4)
 end
 
+-- Strategy Dispatcher
+local function travelTo(targetPos, stopDist, statusText)
+    if statusText then
+        updateStatus(statusText, "navigation")
+    end
+
+    if AutoCollector.MovementMethod == "Tween" then
+        return travelByTween(targetPos, stopDist)
+    elseif AutoCollector.MovementMethod == "Walk" then
+        return travelByWalk(targetPos, stopDist)
+    else
+        return travelByPathfinding(targetPos, stopDist)
+    end
+end
+
+----------------------------------------------------------------------
+-- EGG COLLECTION & DEPOSIT
+----------------------------------------------------------------------
+
 local function collectEgg(eggInfo)
     local targetPos = eggInfo.pos
-    local reached = walkTo(targetPos, 6)
+    local reached = travelTo(targetPos, 6, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod))
     if not reached or not AutoCollector.Enabled then
         return false, "Failed to navigate to egg"
     end
@@ -596,7 +800,7 @@ local function depositEgg(eggUid)
         return false, "Plot not found"
     end
 
-    local reached = walkTo(depositCFrame.Position, 5)
+    local reached = travelTo(depositCFrame.Position, 5, string.format("Returning to pen (%s)", AutoCollector.MovementMethod))
     if not reached or not AutoCollector.Enabled then
         return false, "Failed to navigate to pen"
     end
@@ -733,12 +937,18 @@ local function startAutoCollectLoop()
         if hum and hrp then
             hum:MoveTo(hrp.Position)
         end
+        if hrp then
+            hrp.AssemblyLinearVelocity = Vector3.new()
+        end
         updateStatus("Idle - Auto Collect disabled", "pause")
     end)
 end
 
 local function stopAutoCollectLoop()
     AutoCollector.Enabled = false
+    if AutoCollector.CancelCurrentMovement then
+        AutoCollector.CancelCurrentMovement()
+    end
     if AutoCollector.Thread then
         task.cancel(AutoCollector.Thread)
         AutoCollector.Thread = nil
@@ -749,8 +959,78 @@ local function stopAutoCollectLoop()
     if hum and hrp then
         hum:MoveTo(hrp.Position)
     end
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.new()
+    end
     updateStatus("Idle - Auto Collect disabled", "pause")
 end
+
+----------------------------------------------------------------------
+-- TAB 2: SECTIONS (Movement System & Egg Collectibles)
+----------------------------------------------------------------------
+
+local MainSectionMovement = TabMain:Section({
+    Title = "Movement System",
+    Icon = "navigation",
+    Opened = true,
+})
+
+MainSectionMovement:Dropdown({
+    Title = "Movement Method",
+    Desc = "Choose travel system for egg collection",
+    Values = { "Pathfinding", "Walk", "Tween" },
+    Value = "Pathfinding",
+    Callback = function(selected)
+        if AutoCollector.CancelCurrentMovement then
+            AutoCollector.CancelCurrentMovement()
+        end
+        AutoCollector.MovementMethod = selected
+        updateMovementUIVisibility()
+        WindUI:Notify({
+            Title = "Movement Method",
+            Content = "Switched to: " .. selected,
+            Duration = 2,
+            Icon = "navigation",
+        })
+    end,
+})
+
+tweenSpeedSlider = MainSectionMovement:Slider({
+    Title = "Tween Speed",
+    Desc = "Studs per second during tween travel",
+    Value = {
+        Min = 10,
+        Max = 200,
+        Default = 45,
+    },
+    Step = 1,
+    Callback = function(val)
+        AutoCollector.TweenSpeed = val
+    end,
+})
+
+walkSpeedSlider = MainSectionMovement:Slider({
+    Title = "Walk Speed Changer",
+    Desc = "Adjust character walk speed for movement testing",
+    Value = {
+        Min = 16,
+        Max = 200,
+        Default = 16,
+    },
+    Step = 1,
+    Callback = function(val)
+        AutoCollector.WalkSpeed = val
+        if LocalPlayer.Character then
+            local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = val
+            end
+        end
+    end,
+})
+
+-- Initialize UI visibility based on current movement method
+updateMovementUIVisibility()
 
 local MainSectionEgg = TabMain:Section({
     Title = "Egg & Collectibles",
@@ -768,7 +1048,7 @@ MainSectionEgg:Toggle({
             startAutoCollectLoop()
             WindUI:Notify({
                 Title = "Auto Collect Started",
-                Content = "Automatic egg collection routine is active.",
+                Content = string.format("Routine active using %s movement.", AutoCollector.MovementMethod),
                 Duration = 3,
                 Icon = "play",
             })
