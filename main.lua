@@ -232,6 +232,55 @@ MainSectionWorld:Dropdown({
     end,
 })
 
+local MainSectionEgg = TabMain:Section({
+    Title = "Egg & Collectibles",
+    Icon = "egg",
+    Opened = true,
+})
+
+MainSectionEgg:Toggle({
+    Title = "Egg Detection Alert",
+    Desc = "Notifies when collectibles spawn or are nearby",
+    Value = false,
+    Callback = function(state)
+        WindUI:Notify({
+            Title = "Egg Alert",
+            Content = state and "Egg alerts enabled" or "Egg alerts disabled",
+            Duration = 2,
+            Icon = state and "bell" or "bell-off",
+        })
+    end,
+})
+
+MainSectionEgg:Dropdown({
+    Title = "Target Egg Rarity",
+    Desc = "Filter which egg rarity to monitor",
+    Values = { "All", "Common", "Rare", "Epic", "Legendary" },
+    Value = "All",
+    Callback = function(selected)
+        WindUI:Notify({
+            Title = "Rarity Filter",
+            Content = "Filter set to: " .. selected,
+            Duration = 2,
+            Icon = "filter",
+        })
+    end,
+})
+
+MainSectionEgg:Slider({
+    Title = "Alert Distance (Studs)",
+    Desc = "Distance threshold for egg notifications",
+    Value = {
+        Min = 10,
+        Max = 200,
+        Default = 50,
+    },
+    Step = 5,
+    Callback = function(val)
+        -- Notification distance threshold
+    end,
+})
+
 ----------------------------------------------------------------------
 -- TAB 3: VISUALS (Ready for ESP / Display features)
 ----------------------------------------------------------------------
