@@ -1424,7 +1424,6 @@ SettingsSectionConfig:Button({
     Title = "Unload Frost Hub",
     Desc = "Cleanly removes the UI from your screen",
     Icon = "trash-2",
-    Color = Color3.fromRGB(235, 87, 87),
     Callback = function()
         Window:Dialog({
             Title = "Unload Frost Hub",
