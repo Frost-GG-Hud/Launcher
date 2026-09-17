@@ -357,6 +357,18 @@ local function setupFieldEggNetworking()
             end)
         end
     end)
+
+    pcall(function()
+        if EggState and EggState.FieldGone and typeof(EggState.FieldGone.Connect) == "function" then
+            EggState.FieldGone:Connect(function(uid)
+                if uid == AutoCollector.CarriedEggUid then
+                    AutoCollector.IsCarrying = false
+                    AutoCollector.CarriedEggUid = nil
+                    DepositSignal:Fire({ Uid = uid, State = "Gone" })
+                end
+            end)
+        end
+    end)
 end
 task.spawn(setupFieldEggNetworking)
 
@@ -395,14 +407,12 @@ local function updateStats()
 end
 
 local function isCarryingEgg()
-    if AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
-        return true, nil, AutoCollector.CarriedEggUid
-    end
-
+    -- 1. Check live field egg snapshot as authoritative ground truth
     if EggState and EggState.ReadFieldEggs then
         local eggsData = nil
         pcall(function() eggsData = EggState.ReadFieldEggs() end)
         if eggsData and eggsData.Records then
+            local found = false
             for _, rec in pairs(eggsData.Records) do
                 if rec and rec.State == "Carried" and rec.CarrierUserId == LocalPlayer.UserId then
                     AutoCollector.IsCarrying = true
@@ -410,7 +420,12 @@ local function isCarryingEgg()
                     return true, nil, rec.Uid
                 end
             end
+            -- If snapshot is valid and user has no carried record, user is NOT carrying a field egg
+            AutoCollector.IsCarrying = false
+            AutoCollector.CarriedEggUid = nil
         end
+    elseif AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
+        return true, nil, AutoCollector.CarriedEggUid
     end
 
     local char = LocalPlayer.Character
