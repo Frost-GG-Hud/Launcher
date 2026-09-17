@@ -295,6 +295,9 @@ pcall(function()
     end
 end)
 
+local CarrySignal = Instance.new("BindableEvent")
+local DepositSignal = Instance.new("BindableEvent")
+
 local AutoCollector = {
     Enabled = false,
     CurrentTarget = nil,
@@ -304,12 +307,58 @@ local AutoCollector = {
     TweenSpeed = 45,
     WalkSpeed = 16,
     CancelCurrentMovement = nil,
+    IsCarrying = false,
+    CarriedEggUid = nil,
+    CarriedPayload = nil,
     Stats = {
         Collected = 0,
         Deposited = 0,
     },
     Thread = nil,
 }
+
+local function setupFieldEggNetworking()
+    pcall(function()
+        local net = ReplicatedStorage:WaitForChild("Packages", 5) and ReplicatedStorage.Packages:WaitForChild("Networking", 5)
+        if not net then return end
+        local shiftedEvent = net:WaitForChild("RE/EggWorld/FieldEggShifted", 5)
+        if not shiftedEvent or not shiftedEvent:IsA("RemoteEvent") then return end
+
+        shiftedEvent.OnClientEvent:Connect(function(payload)
+            if type(payload) ~= "table" then return end
+
+            if payload.CarrierUserId == LocalPlayer.UserId and payload.State == "Carried" then
+                AutoCollector.IsCarrying = true
+                AutoCollector.CarriedEggUid = payload.Uid
+                AutoCollector.CarriedPayload = payload
+                CarrySignal:Fire(payload)
+            elseif (payload.Uid == AutoCollector.CarriedEggUid and (payload.State ~= "Carried" or payload.CarrierUserId ~= LocalPlayer.UserId))
+                or (payload.CarrierUserId == LocalPlayer.UserId and payload.State ~= "Carried") then
+                AutoCollector.IsCarrying = false
+                AutoCollector.CarriedEggUid = nil
+                AutoCollector.CarriedPayload = nil
+                DepositSignal:Fire(payload)
+            end
+        end)
+    end)
+
+    pcall(function()
+        if EggState and EggState.CarryChanged and typeof(EggState.CarryChanged.Connect) == "function" then
+            EggState.CarryChanged:Connect(function(carrierUserId, eggUid)
+                if carrierUserId == LocalPlayer.UserId then
+                    AutoCollector.IsCarrying = true
+                    AutoCollector.CarriedEggUid = eggUid
+                    CarrySignal:Fire({ CarrierUserId = carrierUserId, Uid = eggUid, State = "Carried" })
+                elseif AutoCollector.CarriedEggUid == eggUid and carrierUserId ~= LocalPlayer.UserId then
+                    AutoCollector.IsCarrying = false
+                    AutoCollector.CarriedEggUid = nil
+                    DepositSignal:Fire({ CarrierUserId = carrierUserId, Uid = eggUid, State = "None" })
+                end
+            end)
+        end
+    end)
+end
+task.spawn(setupFieldEggNetworking)
 
 local statusParagraph = nil
 local statsParagraph = nil
@@ -346,10 +395,28 @@ local function updateStats()
 end
 
 local function isCarryingEgg()
+    if AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
+        return true, nil, AutoCollector.CarriedEggUid
+    end
+
+    if EggState and EggState.ReadFieldEggs then
+        local eggsData = nil
+        pcall(function() eggsData = EggState.ReadFieldEggs() end)
+        if eggsData and eggsData.Records then
+            for _, rec in pairs(eggsData.Records) do
+                if rec and rec.State == "Carried" and rec.CarrierUserId == LocalPlayer.UserId then
+                    AutoCollector.IsCarrying = true
+                    AutoCollector.CarriedEggUid = rec.Uid
+                    return true, nil, rec.Uid
+                end
+            end
+        end
+    end
+
     local char = LocalPlayer.Character
     if char then
         for _, item in ipairs(char:GetChildren()) do
-            if item:IsA("Tool") and item:GetAttribute("ItemType") == "AssetEgg" then
+            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item.Name:lower():find("egg")) then
                 return true, item, item:GetAttribute("UID")
             end
         end
@@ -357,7 +424,7 @@ local function isCarryingEgg()
     local bp = LocalPlayer:FindFirstChild("Backpack")
     if bp then
         for _, item in ipairs(bp:GetChildren()) do
-            if item:IsA("Tool") and item:GetAttribute("ItemType") == "AssetEgg" then
+            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item.Name:lower():find("egg")) then
                 return true, item, item:GetAttribute("UID")
             end
         end
@@ -706,16 +773,18 @@ end
 
 local function collectEgg(eggInfo)
     local targetPos = eggInfo.pos
+    print(string.format("[Egg] Moving to egg"))
     local reached = travelTo(targetPos, 6, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod))
     if not reached or not AutoCollector.Enabled then
         return false, "Failed to navigate to egg"
     end
 
     updateStatus(string.format("Collecting %s egg...", eggInfo.name), "loader")
+    print("[Egg] Collection requested")
 
-    -- Trigger ProximityPrompt if in workspace
+    -- 1. Trigger ProximityPrompt if in workspace
     for _, part in ipairs(Workspace:GetChildren()) do
-        if part.Name == "SmartPromptPart" and (part.Position - targetPos).Magnitude <= 12 then
+        if part.Name == "SmartPromptPart" and (part.Position - targetPos).Magnitude <= 15 then
             local prompt = part:FindFirstChild("CarryAreaEgg")
             if prompt and prompt:IsA("ProximityPrompt") then
                 if fireproximityprompt then
@@ -725,27 +794,62 @@ local function collectEgg(eggInfo)
             end
         end
     end
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Name == "CarryAreaEgg" and desc.Parent and desc.Parent:IsA("BasePart") and (desc.Parent.Position - targetPos).Magnitude <= 15 then
+            if fireproximityprompt then
+                fireproximityprompt(desc)
+            end
+            break
+        end
+    end
 
-    -- Trigger server carry action legitimately
+    -- 2. Server carry invocation fallback
     pcall(function()
         if EggState and EggState.CarryFieldEgg then
             EggState.CarryFieldEgg(eggInfo.uid)
         else
             local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
             if net and net:FindFirstChild("RF/EggWorld/AskFieldEggCarry") then
-                net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer(eggInfo.uid)
+                local pc = LocalPlayer:FindFirstChild("PlayerScripts")
+                    and LocalPlayer.PlayerScripts:FindFirstChild("Game")
+                    and LocalPlayer.PlayerScripts.Game:FindFirstChild("PlatformController")
+                if pc then
+                    net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer(pc)
+                end
+                net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer({ Uid = eggInfo.uid })
             end
         end
     end)
 
-    -- Wait for carried state confirmation
+    -- 3. Event-driven wait for carried state confirmation
+    local carryConfirmed = false
+    local carryPayload = nil
+    local carryConn = nil
+
+    carryConn = CarrySignal.Event:Connect(function(payload)
+        carryConfirmed = true
+        carryPayload = payload
+    end)
+
     local startWait = tick()
-    while tick() - startWait < 4 and AutoCollector.Enabled do
-        local carrying, tool, uid = isCarryingEgg()
+    while tick() - startWait < 4 and AutoCollector.Enabled and not carryConfirmed do
+        local carrying, _, uid = isCarryingEgg()
         if carrying then
-            return true, uid or eggInfo.uid
+            carryConfirmed = true
+            break
         end
-        task.wait(0.15)
+        task.wait(0.05)
+    end
+
+    if carryConn then
+        carryConn:Disconnect()
+    end
+
+    if carryConfirmed then
+        print("[Egg] Carry request confirmed")
+        print("[Egg] State changed: Carried")
+        print(string.format("[Egg] Carrier confirmed: %s", tostring(LocalPlayer.UserId)))
+        return true, AutoCollector.CarriedEggUid or eggInfo.uid
     end
 
     return false, "Collection confirmation timeout"
@@ -800,31 +904,40 @@ local function depositEgg(eggUid)
         return false, "Plot not found"
     end
 
+    print("[Deposit] Approaching base")
     local reached = travelTo(depositCFrame.Position, 5, string.format("Returning to pen (%s)", AutoCollector.MovementMethod))
     if not reached or not AutoCollector.Enabled then
         return false, "Failed to navigate to pen"
     end
 
     updateStatus("Depositing egg in pen...", "download")
+    print("[Deposit] Deposit requested")
 
     local carrying, tool, uid = isCarryingEgg()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if tool and char and hum and tool.Parent ~= char then
         hum:EquipTool(tool)
-        task.wait(0.2)
+        task.wait(0.15)
     end
 
     local localCFrame = centerPart.CFrame:ToObjectSpace(depositCFrame)
+    local targetUid = eggUid or uid or AutoCollector.CarriedEggUid
+
+    local depositConfirmed = false
+    local depConn = nil
+    depConn = DepositSignal.Event:Connect(function(payload)
+        depositConfirmed = true
+    end)
 
     pcall(function()
         if EggState and EggState.PlantEgg then
-            EggState.PlantEgg(eggUid or uid, localCFrame)
+            EggState.PlantEgg(targetUid, localCFrame)
         else
             local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
             if net and net:FindFirstChild("RF/EggWorld/AskPlaceEgg") then
                 net["RF/EggWorld/AskPlaceEgg"]:InvokeServer({
-                    Uid = eggUid or uid,
+                    Uid = targetUid,
                     LocalCFrame = localCFrame
                 })
             end
@@ -836,12 +949,24 @@ local function depositEgg(eggUid)
     end
 
     local startWait = tick()
-    while tick() - startWait < 4 and AutoCollector.Enabled do
+    while tick() - startWait < 4 and AutoCollector.Enabled and not depositConfirmed do
         local stillCarrying = isCarryingEgg()
         if not stillCarrying then
-            return true
+            depositConfirmed = true
+            break
         end
-        task.wait(0.15)
+        task.wait(0.08)
+    end
+
+    if depConn then
+        depConn:Disconnect()
+    end
+
+    if depositConfirmed or not isCarryingEgg() then
+        AutoCollector.IsCarrying = false
+        AutoCollector.CarriedEggUid = nil
+        print("[Egg] Deposit confirmed")
+        return true
     end
 
     return false, "Deposit confirmation timeout"
@@ -866,7 +991,13 @@ local function startAutoCollectLoop()
 
             local carrying, tool, uid = isCarryingEgg()
             if carrying then
+                if AutoCollector.CancelCurrentMovement then
+                    AutoCollector.CancelCurrentMovement()
+                end
+                print("[Movement] Target changed: Base")
+                print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
                 updateStatus("Carrying egg - returning to pen...", "arrow-left-circle")
+
                 local depOk, depErr = depositEgg(uid)
                 if depOk then
                     AutoCollector.Stats.Deposited = AutoCollector.Stats.Deposited + 1
@@ -897,6 +1028,8 @@ local function startAutoCollectLoop()
             AutoCollector.CurrentTarget = targetEgg
             updateStatus(string.format("Navigating to %s (%d studs, %s)", targetEgg.name, math.floor(targetEgg.dist), targetEgg.area), "navigation")
 
+            print(string.format("[Egg] Found egg: %s", targetEgg.name or "Unknown"))
+
             local colOk, colUid = collectEgg(targetEgg)
             if not colOk or not AutoCollector.Enabled then
                 updateStatus("Collection unsuccessful, checking next...", "refresh-cw")
@@ -913,6 +1046,13 @@ local function startAutoCollectLoop()
                 Icon = "egg",
             })
 
+            -- IMMEDIATELY CANCEL EGG MOVEMENT AND SWITCH TARGET TO BASE
+            if AutoCollector.CancelCurrentMovement then
+                AutoCollector.CancelCurrentMovement()
+            end
+            print("[Movement] Target changed: Base")
+            print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
+
             local depOk, depErr = depositEgg(colUid or targetEgg.uid)
             if depOk then
                 AutoCollector.Stats.Deposited = AutoCollector.Stats.Deposited + 1
@@ -924,7 +1064,7 @@ local function startAutoCollectLoop()
                     Icon = "check-circle",
                 })
                 updateStatus("Deposit complete! Searching next egg...", "check")
-                task.wait(0.8)
+                task.wait(0.5)
             else
                 updateStatus("Deposit issue: " .. tostring(depErr), "alert-triangle")
                 task.wait(1.5)
