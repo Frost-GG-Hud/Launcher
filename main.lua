@@ -406,6 +406,9 @@ local function setupFieldEggNetworking()
                 AutoCollector.IsCarrying = true
                 AutoCollector.CarriedEggUid = payload.Uid
                 AutoCollector.CarriedPayload = payload
+                if AutoCollector.CancelCurrentMovement then
+                    AutoCollector.CancelCurrentMovement()
+                end
                 CarrySignal:Fire(payload)
             elseif (payload.Uid == AutoCollector.CarriedEggUid and (payload.State ~= "Carried" or payload.CarrierUserId ~= LocalPlayer.UserId))
                 or (payload.CarrierUserId == LocalPlayer.UserId and payload.State ~= "Carried") then
@@ -423,6 +426,9 @@ local function setupFieldEggNetworking()
                 if carrierUserId == LocalPlayer.UserId then
                     AutoCollector.IsCarrying = true
                     AutoCollector.CarriedEggUid = eggUid
+                    if AutoCollector.CancelCurrentMovement then
+                        AutoCollector.CancelCurrentMovement()
+                    end
                     CarrySignal:Fire({ CarrierUserId = carrierUserId, Uid = eggUid, State = "Carried" })
                 elseif AutoCollector.CarriedEggUid == eggUid and carrierUserId ~= LocalPlayer.UserId then
                     AutoCollector.IsCarrying = false
@@ -492,12 +498,37 @@ local function updateStats()
 end
 
 local function isCarryingEgg()
-    -- 1. Check live field egg snapshot as authoritative ground truth
+    if AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
+        return true, nil, AutoCollector.CarriedEggUid
+    end
+
+    local char = LocalPlayer.Character
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item:GetAttribute("UID") or item.Name:lower():find("egg")) then
+                local uid = item:GetAttribute("UID") or "carried_egg"
+                AutoCollector.IsCarrying = true
+                AutoCollector.CarriedEggUid = uid
+                return true, item, uid
+            end
+        end
+    end
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    if bp then
+        for _, item in ipairs(bp:GetChildren()) do
+            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item:GetAttribute("UID") or item.Name:lower():find("egg")) then
+                local uid = item:GetAttribute("UID") or "carried_egg"
+                AutoCollector.IsCarrying = true
+                AutoCollector.CarriedEggUid = uid
+                return true, item, uid
+            end
+        end
+    end
+
     if EggState and EggState.ReadFieldEggs then
         local eggsData = nil
         pcall(function() eggsData = EggState.ReadFieldEggs() end)
         if eggsData and eggsData.Records then
-            local found = false
             for _, rec in pairs(eggsData.Records) do
                 if rec and rec.State == "Carried" and rec.CarrierUserId == LocalPlayer.UserId then
                     AutoCollector.IsCarrying = true
@@ -505,30 +536,9 @@ local function isCarryingEgg()
                     return true, nil, rec.Uid
                 end
             end
-            -- If snapshot is valid and user has no carried record, user is NOT carrying a field egg
-            AutoCollector.IsCarrying = false
-            AutoCollector.CarriedEggUid = nil
         end
-    elseif AutoCollector.IsCarrying and AutoCollector.CarriedEggUid then
-        return true, nil, AutoCollector.CarriedEggUid
     end
 
-    local char = LocalPlayer.Character
-    if char then
-        for _, item in ipairs(char:GetChildren()) do
-            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item.Name:lower():find("egg")) then
-                return true, item, item:GetAttribute("UID")
-            end
-        end
-    end
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if bp then
-        for _, item in ipairs(bp:GetChildren()) do
-            if item:IsA("Tool") and (item:GetAttribute("ItemType") == "AssetEgg" or item.Name:lower():find("egg")) then
-                return true, item, item:GetAttribute("UID")
-            end
-        end
-    end
     return false, nil, nil
 end
 
@@ -626,8 +636,21 @@ end
 -- NAVIGATION STRATEGIES (Tween, Walk, Pathfinding)
 ----------------------------------------------------------------------
 
+-- Calculate adaptive movement speed that respects game movement validation
+local function getAdaptiveSpeed(requestedSpeed)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local legitimateSpeed = (hum and hum.WalkSpeed and hum.WalkSpeed > 0) and hum.WalkSpeed or 32
+    local speed = tonumber(requestedSpeed) or legitimateSpeed
+    -- Keep speed adaptive so it stays within reasonable movement limits
+    if speed > legitimateSpeed then
+        speed = legitimateSpeed
+    end
+    return math.max(16, speed)
+end
+
 -- 1. Tween Navigation
-local function travelByTween(targetPos, stopDist)
+local function travelByTween(targetPos, stopDist, isApproachingEgg)
     stopDist = stopDist or 5
     local char = LocalPlayer.Character
     if not char then return false end
@@ -635,9 +658,12 @@ local function travelByTween(targetPos, stopDist)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return false end
 
-    local destPos = targetPos + Vector3.new(0, 1.5, 0)
-    local dist = (hrp.Position - destPos).Magnitude
-    if dist <= stopDist then return true end
+    local initialDist = (hrp.Position - targetPos).Magnitude
+    if initialDist <= stopDist then return true end
+
+    local speed = getAdaptiveSpeed(AutoCollector.TweenSpeed)
+    print("[AutoCollect] Movement started")
+    print(string.format("[AutoCollect] Speed = %d", math.floor(speed)))
 
     local activeTween = nil
     local cancelled = false
@@ -667,45 +693,63 @@ local function travelByTween(targetPos, stopDist)
         hum = char:FindFirstChildOfClass("Humanoid")
         if not hrp or not hum or hum.Health <= 0 then break end
 
-        local remainingDist = (hrp.Position - destPos).Magnitude
+        if isApproachingEgg and AutoCollector.IsCarrying then
+            cancelled = true
+            break
+        end
+
+        local currentPos = hrp.Position
+        local remainingDist = (currentPos - targetPos).Magnitude
         if remainingDist <= stopDist then
             arrived = true
             break
         end
 
-        local speed = math.max(1, AutoCollector.TweenSpeed)
-        local duration = remainingDist / speed
+        speed = getAdaptiveSpeed(AutoCollector.TweenSpeed)
+        local stepDist = math.min(remainingDist, 35)
+        local direction = (targetPos - currentPos).Unit
+        local nextStepPos = currentPos + direction * stepDist
+
+        -- Adjust Y to terrain height to avoid clipping under terrain or large CFrame jumps
+        local raycastParams = RaycastParams.new()
+        raycastParams.FilterDescendantsInstances = { char, Workspace:FindFirstChild("__OBJECTS") and Workspace.__OBJECTS:FindFirstChild("Areas") }
+        raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+        local hit = Workspace:Raycast(nextStepPos + Vector3.new(0, 10, 0), Vector3.new(0, -30, 0), raycastParams)
+        if hit and hit.Position then
+            nextStepPos = Vector3.new(nextStepPos.X, hit.Position.Y + 2.5, nextStepPos.Z)
+        end
+
+        local stepDuration = stepDist / speed
+        if stepDuration <= 0.02 then
+            stepDuration = 0.05
+        end
 
         stopActiveTween()
-        hrp.AssemblyLinearVelocity = Vector3.new()
+        local stepCFrame = CFrame.new(nextStepPos, nextStepPos + Vector3.new(direction.X, 0, direction.Z))
 
-        local direction = (destPos - hrp.Position).Unit
-        local targetCFrame = CFrame.new(destPos, destPos + direction)
+        hum:MoveTo(nextStepPos)
 
         activeTween = TweenService:Create(
             hrp,
-            TweenInfo.new(duration, Enum.EasingStyle.Linear),
-            { CFrame = targetCFrame }
+            TweenInfo.new(stepDuration, Enum.EasingStyle.Linear),
+            { CFrame = stepCFrame }
         )
         activeTween:Play()
 
-        local currentSpeedAtStart = speed
         local pollStart = tick()
-
-        -- Check completion while allowing dynamic speed change or cancellation
-        while tick() - pollStart < duration and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Tween" do
-            if AutoCollector.TweenSpeed ~= currentSpeedAtStart then
-                -- Speed updated mid-flight! Recalculate remaining duration with new speed
+        while (tick() - pollStart) < stepDuration and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Tween" do
+            if isApproachingEgg and AutoCollector.IsCarrying then
+                cancelled = true
                 break
             end
-            if (hrp.Position - destPos).Magnitude <= stopDist then
+            if (hrp.Position - targetPos).Magnitude <= stopDist then
                 arrived = true
                 break
             end
-            task.wait(0.04)
+            task.wait(0.03)
         end
 
-        if (hrp.Position - destPos).Magnitude <= stopDist then
+        if (hrp.Position - targetPos).Magnitude <= stopDist then
             arrived = true
             break
         end
@@ -718,11 +762,11 @@ local function travelByTween(targetPos, stopDist)
         hrp.AssemblyLinearVelocity = Vector3.new()
     end
 
-    return arrived
+    return arrived or (isApproachingEgg and AutoCollector.IsCarrying)
 end
 
 -- 2. Direct Walk Navigation
-local function travelByWalk(targetPos, stopDist)
+local function travelByWalk(targetPos, stopDist, isApproachingEgg)
     stopDist = stopDist or 5
     local char = LocalPlayer.Character
     if not char then return false end
@@ -730,13 +774,20 @@ local function travelByWalk(targetPos, stopDist)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum or hum.Health <= 0 then return false end
 
+    local dist = (hrp.Position - targetPos).Magnitude
+    if dist <= stopDist then return true end
+
+    local speed = getAdaptiveSpeed(AutoCollector.WalkSpeed)
+    hum.WalkSpeed = speed
+    print("[AutoCollect] Movement started")
+    print(string.format("[AutoCollect] Speed = %d", math.floor(speed)))
+
     local cancelled = false
     AutoCollector.CancelCurrentMovement = function()
         cancelled = true
-        if hum and hrp then hum:MoveTo(hrp.Position) end
+        if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
     end
 
-    hum.WalkSpeed = AutoCollector.WalkSpeed
     hum:MoveTo(targetPos)
 
     local lastPos = hrp.Position
@@ -749,14 +800,20 @@ local function travelByWalk(targetPos, stopDist)
         hum = char:FindFirstChildOfClass("Humanoid")
         if not hrp or not hum or hum.Health <= 0 then break end
 
-        local dist = (hrp.Position - targetPos).Magnitude
-        if dist <= stopDist then
+        if isApproachingEgg and AutoCollector.IsCarrying then
+            cancelled = true
+            break
+        end
+
+        local currentDist = (hrp.Position - targetPos).Magnitude
+        if currentDist <= stopDist then
             hum:MoveTo(hrp.Position)
             AutoCollector.CancelCurrentMovement = nil
             return true
         end
 
-        hum.WalkSpeed = AutoCollector.WalkSpeed
+        speed = getAdaptiveSpeed(AutoCollector.WalkSpeed)
+        hum.WalkSpeed = speed
         hum:MoveTo(targetPos)
 
         if (hrp.Position - lastPos).Magnitude > 0.8 then
@@ -770,13 +827,13 @@ local function travelByWalk(targetPos, stopDist)
         task.wait(0.1)
     end
 
-    if hum and hrp then hum:MoveTo(hrp.Position) end
+    if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
     AutoCollector.CancelCurrentMovement = nil
-    return (hrp.Position - targetPos).Magnitude <= (stopDist + 2)
+    return (hrp.Position - targetPos).Magnitude <= (stopDist + 2) or (isApproachingEgg and AutoCollector.IsCarrying)
 end
 
 -- 3. Pathfinding Navigation
-local function travelByPathfinding(targetPos, stopDist)
+local function travelByPathfinding(targetPos, stopDist, isApproachingEgg)
     stopDist = stopDist or 5
     local char = LocalPlayer.Character
     if not char then return false end
@@ -788,12 +845,15 @@ local function travelByPathfinding(targetPos, stopDist)
         return true
     end
 
-    hum.WalkSpeed = AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed or 32
+    local speed = getAdaptiveSpeed(AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed)
+    hum.WalkSpeed = speed
+    print("[AutoCollect] Movement started")
+    print(string.format("[AutoCollect] Speed = %d", math.floor(speed)))
 
     local cancelled = false
     AutoCollector.CancelCurrentMovement = function()
         cancelled = true
-        if hum and hrp then hum:MoveTo(hrp.Position) end
+        if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
     end
 
     local path = PathfindingService:CreatePath({
@@ -811,11 +871,12 @@ local function travelByPathfinding(targetPos, stopDist)
         hum:MoveTo(targetPos)
         local startTime = tick()
         while not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Pathfinding" and (hrp.Position - targetPos).Magnitude > stopDist do
+            if isApproachingEgg and AutoCollector.IsCarrying then break end
             if tick() - startTime > 10 then break end
-            task.wait(0.2)
+            task.wait(0.1)
         end
         AutoCollector.CancelCurrentMovement = nil
-        return (hrp.Position - targetPos).Magnitude <= (stopDist + 3)
+        return (hrp.Position - targetPos).Magnitude <= (stopDist + 3) or (isApproachingEgg and AutoCollector.IsCarrying)
     end
 
     local waypoints = path:GetWaypoints()
@@ -824,9 +885,15 @@ local function travelByPathfinding(targetPos, stopDist)
 
     for idx, wp in ipairs(waypoints) do
         if cancelled or (not AutoCollector.Enabled and not AutoPlanter.Enabled) or AutoCollector.MovementMethod ~= "Pathfinding" then
-            if hum and hrp then hum:MoveTo(hrp.Position) end
+            if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
             AutoCollector.CancelCurrentMovement = nil
-            return false
+            return (isApproachingEgg and AutoCollector.IsCarrying) or false
+        end
+
+        if isApproachingEgg and AutoCollector.IsCarrying then
+            if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
+            AutoCollector.CancelCurrentMovement = nil
+            return true
         end
 
         char = LocalPlayer.Character
@@ -841,7 +908,7 @@ local function travelByPathfinding(targetPos, stopDist)
             return true
         end
 
-        hum.WalkSpeed = AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed or 32
+        hum.WalkSpeed = getAdaptiveSpeed(AutoCollector.PathfindingSpeed or AutoCollector.WalkSpeed)
 
         if wp.Action == Enum.PathWaypointAction.Jump then
             hum.Jump = true
@@ -853,6 +920,10 @@ local function travelByPathfinding(targetPos, stopDist)
         local wpStartTime = tick()
 
         while not wpReached and not cancelled and (AutoCollector.Enabled or AutoPlanter.Enabled) and AutoCollector.MovementMethod == "Pathfinding" do
+            if isApproachingEgg and AutoCollector.IsCarrying then
+                wpReached = true
+                break
+            end
             local distToWp = (hrp.Position - wp.Position).Magnitude
             if distToWp <= 3.5 or (hrp.Position - targetPos).Magnitude <= stopDist then
                 wpReached = true
@@ -872,27 +943,27 @@ local function travelByPathfinding(targetPos, stopDist)
                 break
             end
 
-            task.wait(0.05)
+            task.wait(0.04)
         end
     end
 
-    if hum and hrp then hum:MoveTo(hrp.Position) end
+    if hum and hrp and hrp.Parent then hum:MoveTo(hrp.Position) end
     AutoCollector.CancelCurrentMovement = nil
-    return (hrp.Position - targetPos).Magnitude <= (stopDist + 4)
+    return (hrp.Position - targetPos).Magnitude <= (stopDist + 4) or (isApproachingEgg and AutoCollector.IsCarrying)
 end
 
 -- Strategy Dispatcher
-local function travelTo(targetPos, stopDist, statusText)
+local function travelTo(targetPos, stopDist, statusText, isApproachingEgg)
     if statusText then
         updateStatus(statusText, "navigation")
     end
 
     if AutoCollector.MovementMethod == "Tween" then
-        return travelByTween(targetPos, stopDist)
+        return travelByTween(targetPos, stopDist, isApproachingEgg)
     elseif AutoCollector.MovementMethod == "Walk" then
-        return travelByWalk(targetPos, stopDist)
+        return travelByWalk(targetPos, stopDist, isApproachingEgg)
     else
-        return travelByPathfinding(targetPos, stopDist)
+        return travelByPathfinding(targetPos, stopDist, isApproachingEgg)
     end
 end
 
@@ -902,14 +973,25 @@ end
 
 local function collectEgg(eggInfo)
     local targetPos = eggInfo.pos
-    print(string.format("[Egg] Moving to egg"))
-    local reached = travelTo(targetPos, 6, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod))
+    local reached = travelTo(targetPos, 6, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod), true)
+
+    if AutoCollector.IsCarrying then
+        print("[AutoCollect] Egg equipped")
+        print("[AutoCollect] State = Carried")
+        return true, AutoCollector.CarriedEggUid or eggInfo.uid
+    end
+
     if not reached or not AutoCollector.Enabled then
+        local carrying, _, uid = isCarryingEgg()
+        if carrying or AutoCollector.IsCarrying then
+            print("[AutoCollect] Egg equipped")
+            print("[AutoCollect] State = Carried")
+            return true, uid or AutoCollector.CarriedEggUid or eggInfo.uid
+        end
         return false, "Failed to navigate to egg"
     end
 
     updateStatus(string.format("Collecting %s egg...", eggInfo.name), "loader")
-    print("[Egg] Collection requested")
 
     -- 1. Trigger ProximityPrompt if in workspace
     for _, part in ipairs(Workspace:GetChildren()) do
@@ -934,36 +1016,33 @@ local function collectEgg(eggInfo)
 
     -- 2. Server carry invocation fallback
     pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
+        if net and net:FindFirstChild("RF/EggWorld/AskFieldEggCarry") then
+            local pc = LocalPlayer:FindFirstChild("PlayerScripts")
+                and LocalPlayer.PlayerScripts:FindFirstChild("Game")
+                and LocalPlayer.PlayerScripts.Game:FindFirstChild("PlatformController")
+            if pc then
+                net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer(pc)
+            end
+            net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer({ Uid = eggInfo.uid })
+        end
         if EggState and EggState.CarryFieldEgg then
             EggState.CarryFieldEgg(eggInfo.uid)
-        else
-            local net = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.Packages:FindFirstChild("Networking")
-            if net and net:FindFirstChild("RF/EggWorld/AskFieldEggCarry") then
-                local pc = LocalPlayer:FindFirstChild("PlayerScripts")
-                    and LocalPlayer.PlayerScripts:FindFirstChild("Game")
-                    and LocalPlayer.PlayerScripts.Game:FindFirstChild("PlatformController")
-                if pc then
-                    net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer(pc)
-                end
-                net["RF/EggWorld/AskFieldEggCarry"]:InvokeServer({ Uid = eggInfo.uid })
-            end
         end
     end)
 
     -- 3. Event-driven wait for carried state confirmation
     local carryConfirmed = false
-    local carryPayload = nil
     local carryConn = nil
 
-    carryConn = CarrySignal.Event:Connect(function(payload)
+    carryConn = CarrySignal.Event:Connect(function()
         carryConfirmed = true
-        carryPayload = payload
     end)
 
     local startWait = tick()
-    while tick() - startWait < 4 and AutoCollector.Enabled and not carryConfirmed do
-        local carrying, _, uid = isCarryingEgg()
-        if carrying then
+    while tick() - startWait < 3 and AutoCollector.Enabled and not carryConfirmed do
+        local carrying = isCarryingEgg()
+        if carrying or AutoCollector.IsCarrying then
             carryConfirmed = true
             break
         end
@@ -974,10 +1053,9 @@ local function collectEgg(eggInfo)
         carryConn:Disconnect()
     end
 
-    if carryConfirmed then
-        print("[Egg] Carry request confirmed")
-        print("[Egg] State changed: Carried")
-        print(string.format("[Egg] Carrier confirmed: %s", tostring(LocalPlayer.UserId)))
+    if carryConfirmed or AutoCollector.IsCarrying then
+        print("[AutoCollect] Egg equipped")
+        print("[AutoCollect] State = Carried")
         return true, AutoCollector.CarriedEggUid or eggInfo.uid
     end
 
@@ -986,18 +1064,16 @@ end
 
 local function secureCarriedEggAtSafeArea(eggUid)
     local safePos = getSafeAreaPosition()
+    print("[AutoCollect] Target = Safe Area")
     updateStatus(string.format("Returning to Safe Area (%s)...", AutoCollector.MovementMethod), "shield")
-    print("[Movement] Target changed: Safe Area")
-    print(string.format("[Movement] Starting %s", AutoCollector.MovementMethod))
-    print("[Deposit] Approaching safe area")
 
-    local reached = travelTo(safePos, 8, string.format("Returning to Safe Area (%s)", AutoCollector.MovementMethod))
+    local reached = travelTo(safePos, 8, string.format("Returning to Safe Area (%s)", AutoCollector.MovementMethod), false)
     if not reached or not AutoCollector.Enabled then
         return false, "Failed to navigate to safe area"
     end
 
+    print("[AutoCollect] Arrived at Safe Area")
     updateStatus("Safe Area reached - Securing egg...", "check-circle")
-    print("[Deposit] Safe area reached - Completing collection")
 
     -- Complete normal egg collection/deposit interaction:
     -- Unequip the egg via server remote / EggState / Humanoid
@@ -1022,9 +1098,9 @@ local function secureCarriedEggAtSafeArea(eggUid)
 
     -- Wait until unequipped / carried state clears
     local startWait = tick()
-    while tick() - startWait < 3 and AutoCollector.Enabled do
+    while tick() - startWait < 2 and AutoCollector.Enabled do
         local carrying = isCarryingEgg()
-        if not carrying then
+        if not carrying and not AutoCollector.IsCarrying then
             break
         end
         task.wait(0.1)
@@ -1032,7 +1108,8 @@ local function secureCarriedEggAtSafeArea(eggUid)
 
     AutoCollector.IsCarrying = false
     AutoCollector.CarriedEggUid = nil
-    print("[Egg] Safe area reached - Egg secured and unequipped")
+    AutoCollector.CarriedPayload = nil
+    print("[AutoCollect] Deposit completed")
     return true
 end
 
@@ -1054,12 +1131,11 @@ local function startAutoCollectLoop()
             end
 
             local carrying, tool, uid = isCarryingEgg()
-            if carrying then
+            if carrying or AutoCollector.IsCarrying then
                 if AutoCollector.CancelCurrentMovement then
                     AutoCollector.CancelCurrentMovement()
                 end
-                updateStatus("Carrying egg - moving to Safe Area...", "shield")
-                local secOk, secErr = secureCarriedEggAtSafeArea(uid)
+                local secOk, secErr = secureCarriedEggAtSafeArea(uid or AutoCollector.CarriedEggUid)
                 if secOk then
                     AutoCollector.Stats.Collected = AutoCollector.Stats.Collected + 1
                     updateStats()
@@ -1071,7 +1147,7 @@ local function startAutoCollectLoop()
                     })
                 else
                     updateStatus("Safe Area retry: " .. tostring(secErr), "alert-triangle")
-                    task.wait(1.5)
+                    task.wait(0.5)
                 end
                 continue
             end
@@ -1085,7 +1161,7 @@ local function startAutoCollectLoop()
                 else
                     updateStatus("No eligible eggs found. Waiting...", "clock")
                 end
-                task.wait(2)
+                task.wait(1.5)
                 continue
             end
 
@@ -1093,13 +1169,16 @@ local function startAutoCollectLoop()
             AutoCollector.CurrentTarget = targetEgg
             updateStatus(string.format("Navigating to %s ($%s/s, %d studs, %s)", targetEgg.name, targetEgg.valueFormatted, math.floor(targetEgg.dist), targetEgg.area), "navigation")
 
-            print(string.format("[Egg] Found egg: %s (Value: %s/s)", targetEgg.name or "Unknown", targetEgg.valueFormatted))
-
             local colOk, colUid = collectEgg(targetEgg)
             if not colOk or not AutoCollector.Enabled then
-                updateStatus("Collection unsuccessful, checking next...", "refresh-cw")
-                task.wait(1)
-                continue
+                if AutoCollector.IsCarrying then
+                    colOk = true
+                    colUid = AutoCollector.CarriedEggUid or targetEgg.uid
+                else
+                    updateStatus("Collection unsuccessful, checking next...", "refresh-cw")
+                    task.wait(0.5)
+                    continue
+                end
             end
 
             -- IMMEDIATELY CANCEL EGG MOVEMENT AND SWITCH TARGET TO SAFE AREA
@@ -1121,7 +1200,7 @@ local function startAutoCollectLoop()
                 task.wait(0.5)
             else
                 updateStatus("Securing issue: " .. tostring(secErr), "alert-triangle")
-                task.wait(1.5)
+                task.wait(1)
             end
         end
 
