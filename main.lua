@@ -25,6 +25,68 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 
+----------------------------------------------------------------------
+-- ANTI-DEATH & ANTI-CHEAT NEUTRALIZER
+----------------------------------------------------------------------
+-- 1. Disarm ObbyAntiTPClient: prevents the client anti-cheat from calling hum:ChangeState(Dead) / kill() on movement
+local function disarmAntiTeleport()
+    pcall(function()
+        local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+        local gameFolder = ps and ps:FindFirstChild("Game")
+        local obbyAntiTP = gameFolder and gameFolder:FindFirstChild("ObbyAntiTPClient")
+        if obbyAntiTP then
+            obbyAntiTP.Disabled = true
+        end
+        if getconnections then
+            for _, conn in ipairs(getconnections(RunService.Heartbeat)) do
+                local f = conn.Function
+                local info = f and debug.getinfo(f) or {}
+                if info.source and info.source:find("ObbyAntiTPClient") then
+                    pcall(function() conn:Disable() end)
+                end
+            end
+        end
+    end)
+end
+disarmAntiTeleport()
+
+-- 2. Disarm AntiCollisionHighSeedPushBack: prevents tripping/ragdolling into FallingDown/Dead when moving fast
+local function disarmCharacterTrip(char)
+    if not char then return end
+    pcall(function()
+        local pushback = char:WaitForChild("AntiCollisionHighSeedPushBack", 2)
+        if pushback then
+            pushback.Disabled = true
+            pushback:Destroy()
+        end
+    end)
+end
+if LocalPlayer.Character then
+    disarmCharacterTrip(LocalPlayer.Character)
+end
+LocalPlayer.CharacterAdded:Connect(function(char)
+    disarmAntiTeleport()
+    disarmCharacterTrip(char)
+end)
+
+-- 3. Intercept & suppress Guard Strike damage remote
+pcall(function()
+    if hookmetamethod and not _G.FrostHubNamecallHooked then
+        _G.FrostHubNamecallHooked = true
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if (method == "FireServer" or method == "fireServer") and typeof(self) == "Instance" then
+                if self.Name == "RE/GuardPatrol/ForestStrike" then
+                    -- Suppress guard strike damage trigger
+                    return
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+    end
+end)
+
 -- Configure WindUI Parent to avoid CoreGui/Plugin capability isolation
 if WindUI and WindUI.SetParent and LocalPlayer then
     pcall(function()
@@ -673,7 +735,7 @@ end
 
 -- 1. Tween Navigation
 local function travelByTween(targetPos, stopDist, isApproachingEgg)
-    stopDist = stopDist or 5
+    stopDist = stopDist or 2.5
     local char = LocalPlayer.Character
     if not char then return false end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -789,7 +851,7 @@ end
 
 -- 2. Direct Walk Navigation
 local function travelByWalk(targetPos, stopDist, isApproachingEgg)
-    stopDist = stopDist or 5
+    stopDist = stopDist or 2.5
     local char = LocalPlayer.Character
     if not char then return false end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -856,7 +918,7 @@ end
 
 -- 3. Pathfinding Navigation
 local function travelByPathfinding(targetPos, stopDist, isApproachingEgg)
-    stopDist = stopDist or 5
+    stopDist = stopDist or 2.5
     local char = LocalPlayer.Character
     if not char then return false end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -1025,7 +1087,8 @@ end
 local function collectEgg(eggInfo)
     local targetPos = eggInfo.pos
 
-    local reached = travelTo(targetPos, 4.5, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod), true)
+    -- Use tight stopDist of 2.5 studs so server carry distance check succeeds
+    local reached = travelTo(targetPos, 2.5, string.format("Approaching %s (%s)", eggInfo.name, AutoCollector.MovementMethod), true)
 
     local function handleCarriedEgg(uid)
         print("[AutoCollect] Egg equipped")
@@ -1048,6 +1111,13 @@ local function collectEgg(eggInfo)
             return handleCarriedEgg(uid or AutoCollector.CarriedEggUid or eggInfo.uid)
         end
         return false, "Failed to navigate to egg"
+    end
+
+    -- Ensure position is right at the egg to avoid "Get closer to the egg" rejection
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and (hrp.Position - targetPos).Magnitude > 2 then
+        hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 1.2, 0))
     end
 
     updateStatus(string.format("Stealing %s egg...", eggInfo.name), "loader")
@@ -1097,7 +1167,7 @@ local function collectEgg(eggInfo)
     end)
 
     local startWait = tick()
-    while tick() - startWait < 2.5 and AutoCollector.Enabled and not carryConfirmed do
+    while tick() - startWait < 1.8 and AutoCollector.Enabled and not carryConfirmed do
         local carrying = isCarryingEgg()
         if carrying or AutoCollector.IsCarrying then
             carryConfirmed = true
